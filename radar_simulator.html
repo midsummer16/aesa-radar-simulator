@@ -1,0 +1,1159 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>AN/APG-81X 机载有源相控阵 (AESA) 火控雷达全物理闭环模拟器</title>
+<style>
+  :root {
+    --bg0: #04080e;
+    --bg1: #08111c;
+    --bg2: #0d1a29;
+    --bg3: #13253a;
+    --border: #1d3854;
+    --border-hi: #2b5986;
+    --txt: #d6e8f8;
+    --txt-dim: #7b9ab8;
+    --green: #00f59b;
+    --green-dim: #008855;
+    --cyan: #00d8ff;
+    --amber: #ffb800;
+    --red: #ff3b5c;
+    --purple: #b975ff;
+    --font-mono: 'JetBrains Mono', 'Fira Code', 'Consolas', monospace;
+    --font-sans: 'Inter', -apple-system, 'PingFang SC', 'Microsoft YaHei', sans-serif;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    background: var(--bg0);
+    color: var(--txt);
+    font-family: var(--font-sans);
+    font-size: 12px;
+    line-height: 1.4;
+    overflow-x: hidden;
+    user-select: none;
+  }
+  /* Top Header & Telemetry Bar */
+  .top-header {
+    background: linear-gradient(180deg, #0b1828 0%, #060d17 100%);
+    border-bottom: 1px solid var(--border);
+    padding: 6px 12px;
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+  }
+  .brand {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+  }
+  .brand-badge {
+    background: rgba(0, 245, 155, 0.12);
+    border: 1px solid var(--green);
+    color: var(--green);
+    font-family: var(--font-mono);
+    font-weight: 700;
+    font-size: 11px;
+    padding: 2px 7px;
+    border-radius: 3px;
+    letter-spacing: 0.8px;
+  }
+  .brand-title {
+    font-size: 14px;
+    font-weight: 700;
+    color: #fff;
+    letter-spacing: 0.5px;
+  }
+  .brand-sub {
+    font-size: 11px;
+    color: var(--txt-dim);
+  }
+  .mode-bar {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    flex-wrap: wrap;
+  }
+  .mode-btn {
+    background: var(--bg2);
+    border: 1px solid var(--border);
+    color: var(--txt-dim);
+    font-family: var(--font-mono);
+    font-size: 11px;
+    font-weight: 600;
+    padding: 4px 8px;
+    border-radius: 3px;
+    cursor: pointer;
+    transition: all 0.12s;
+  }
+  .mode-btn:hover {
+    border-color: var(--cyan);
+    color: var(--txt);
+  }
+  .mode-btn.active {
+    background: rgba(0, 245, 155, 0.16);
+    border-color: var(--green);
+    color: var(--green);
+    box-shadow: 0 0 8px rgba(0, 245, 155, 0.25);
+  }
+  .sim-controls {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+  .btn {
+    background: var(--bg2);
+    border: 1px solid var(--border);
+    color: var(--txt);
+    font-size: 11px;
+    padding: 4px 9px;
+    border-radius: 3px;
+    cursor: pointer;
+    font-family: var(--font-sans);
+    transition: all 0.12s;
+  }
+  .btn:hover { border-color: var(--cyan); background: var(--bg3); }
+  .btn.primary {
+    background: rgba(0, 216, 255, 0.15);
+    border-color: var(--cyan);
+    color: var(--cyan);
+    font-weight: 600;
+  }
+  .btn.warn {
+    background: rgba(255, 184, 0, 0.15);
+    border-color: var(--amber);
+    color: var(--amber);
+  }
+  .btn.danger {
+    background: rgba(255, 59, 92, 0.15);
+    border-color: var(--red);
+    color: var(--red);
+  }
+  select.compact-select {
+    background: var(--bg2);
+    border: 1px solid var(--border);
+    color: var(--cyan);
+    font-size: 11px;
+    padding: 4px 6px;
+    border-radius: 3px;
+    font-family: var(--font-sans);
+  }
+
+  /* Telemetry Strip */
+  .telemetry-strip {
+    background: #060d16;
+    border-bottom: 1px solid var(--border);
+    padding: 4px 12px;
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(115px, 1fr));
+    gap: 6px;
+    font-family: var(--font-mono);
+  }
+  .tele-item {
+    background: rgba(13, 26, 41, 0.65);
+    border-left: 2px solid var(--border-hi);
+    padding: 2px 7px;
+    display: flex;
+    flex-direction: column;
+  }
+  .tele-label {
+    font-size: 10px;
+    color: var(--txt-dim);
+  }
+  .tele-val {
+    font-size: 12px;
+    font-weight: 700;
+    color: var(--cyan);
+  }
+  .tele-val.ok { color: var(--green); }
+  .tele-val.warn { color: var(--amber); }
+  .tele-val.err { color: var(--red); }
+
+  /* Main 3-Column Workbench */
+  .workbench {
+    display: grid;
+    grid-template-columns: 450px 1fr 430px;
+    gap: 8px;
+    padding: 8px;
+    min-height: calc(100vh - 88px);
+  }
+  @media (max-width: 1500px) {
+    .workbench {
+      grid-template-columns: 420px 1fr 390px;
+    }
+  }
+  @media (max-width: 1200px) {
+    .workbench {
+      grid-template-columns: 1fr;
+    }
+  }
+
+  .col {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    min-width: 0;
+  }
+
+  .panel {
+    background: var(--bg1);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+  }
+  .panel-hdr {
+    background: linear-gradient(90deg, #0e1e30 0%, #09131f 100%);
+    border-bottom: 1px solid var(--border);
+    padding: 5px 10px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 6px;
+  }
+  .panel-title {
+    font-size: 12px;
+    font-weight: 700;
+    color: #fff;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+  .panel-title .dot {
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    background: var(--green);
+    box-shadow: 0 0 6px var(--green);
+  }
+  .panel-body {
+    padding: 8px;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
+
+  /* MFD Bezel with OSB Softkeys */
+  .mfd-bezel {
+    background: #0a1017;
+    border: 2px solid #24384d;
+    border-radius: 6px;
+    padding: 4px;
+    display: grid;
+    grid-template-columns: 28px 1fr 28px;
+    grid-template-rows: 24px 1fr 24px;
+    gap: 3px;
+    align-items: center;
+    justify-items: center;
+  }
+  .osb-row {
+    display: flex;
+    justify-content: space-around;
+    width: 100%;
+    padding: 0 12px;
+  }
+  .osb-col {
+    display: flex;
+    flex-direction: column;
+    justify-content: space-around;
+    height: 100%;
+    padding: 12px 0;
+  }
+  .osb-btn {
+    background: #132030;
+    border: 1px solid #2c4766;
+    color: var(--green);
+    font-family: var(--font-mono);
+    font-size: 9px;
+    font-weight: 700;
+    min-width: 26px;
+    height: 20px;
+    padding: 0 3px;
+    border-radius: 2px;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    text-align: center;
+    line-height: 1;
+  }
+  .osb-btn:hover {
+    border-color: var(--green);
+    background: #1a3047;
+  }
+  .osb-btn.active {
+    background: var(--green);
+    color: #021008;
+    box-shadow: 0 0 6px rgba(0, 245, 155, 0.5);
+  }
+  .mfd-screen-wrap {
+    position: relative;
+    width: 100%;
+    aspect-ratio: 1 / 1;
+    background: #02070b;
+    border: 1px solid #163226;
+    overflow: hidden;
+  }
+  canvas.full-canvas {
+    width: 100%;
+    height: 100%;
+    display: block;
+  }
+
+  /* Center Canvases Grid */
+  .signal-grid-top {
+    display: grid;
+    grid-template-columns: 230px 1fr;
+    gap: 8px;
+  }
+  .signal-grid-bot {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 8px;
+  }
+  @media (max-width: 900px) {
+    .signal-grid-top, .signal-grid-bot {
+      grid-template-columns: 1fr;
+    }
+  }
+  .canvas-box {
+    position: relative;
+    background: #030810;
+    border: 1px solid #15293e;
+    border-radius: 3px;
+    overflow: hidden;
+  }
+
+  /* Right Editor Tabs & Controls */
+  .tab-bar {
+    display: flex;
+    border-bottom: 1px solid var(--border);
+    background: #07101a;
+  }
+  .tab-btn {
+    flex: 1;
+    padding: 7px 6px;
+    background: transparent;
+    border: none;
+    border-bottom: 2px solid transparent;
+    color: var(--txt-dim);
+    font-size: 11px;
+    font-weight: 700;
+    cursor: pointer;
+    transition: all 0.12s;
+  }
+  .tab-btn:hover { color: var(--txt); }
+  .tab-btn.active {
+    color: var(--cyan);
+    border-bottom-color: var(--cyan);
+    background: rgba(0, 216, 255, 0.06);
+  }
+  .tab-pane {
+    display: none;
+    padding: 8px;
+    flex-direction: column;
+    gap: 8px;
+    max-height: 540px;
+    overflow-y: auto;
+  }
+  .tab-pane.active {
+    display: flex;
+  }
+
+  /* Form Controls */
+  .sec-hdr {
+    font-size: 11px;
+    font-weight: 700;
+    color: var(--cyan);
+    border-left: 3px solid var(--cyan);
+    padding-left: 6px;
+    margin-top: 2px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+  }
+  .ctrl-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 6px 8px;
+  }
+  .ctrl-item {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    background: rgba(13, 26, 41, 0.5);
+    border: 1px solid rgba(29, 56, 84, 0.6);
+    padding: 4px 6px;
+    border-radius: 3px;
+  }
+  .ctrl-item.span2 {
+    grid-column: span 2;
+  }
+  .ctrl-lbl {
+    display: flex;
+    justify-content: space-between;
+    font-size: 10px;
+    color: var(--txt-dim);
+  }
+  .ctrl-val {
+    font-family: var(--font-mono);
+    color: var(--green);
+    font-weight: 600;
+  }
+  input[type="range"] {
+    width: 100%;
+    accent-color: var(--cyan);
+    height: 14px;
+    cursor: pointer;
+  }
+  input[type="number"], input[type="text"], select.form-select {
+    background: #060e18;
+    border: 1px solid var(--border);
+    color: var(--txt);
+    font-family: var(--font-mono);
+    font-size: 11px;
+    padding: 3px 5px;
+    border-radius: 2px;
+    width: 100%;
+  }
+  .chip-row {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px;
+  }
+  .chip {
+    background: var(--bg2);
+    border: 1px solid var(--border);
+    color: var(--txt-dim);
+    font-family: var(--font-mono);
+    font-size: 10px;
+    padding: 2px 6px;
+    border-radius: 2px;
+    cursor: pointer;
+  }
+  .chip:hover { border-color: var(--cyan); color: var(--txt); }
+  .chip.active {
+    background: rgba(0, 216, 255, 0.16);
+    border-color: var(--cyan);
+    color: var(--cyan);
+    font-weight: 700;
+  }
+  .chip.eccm.active {
+    background: rgba(0, 245, 155, 0.18);
+    border-color: var(--green);
+    color: var(--green);
+  }
+
+  /* Target & Jammer Cards */
+  .entity-list {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px;
+  }
+  .entity-pill {
+    background: var(--bg2);
+    border: 1px solid var(--border);
+    color: var(--txt);
+    font-family: var(--font-mono);
+    font-size: 11px;
+    padding: 3px 8px;
+    border-radius: 3px;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    gap: 5px;
+  }
+  .entity-pill.active {
+    border-color: var(--green);
+    background: rgba(0, 245, 155, 0.14);
+    color: var(--green);
+    font-weight: 700;
+  }
+  .status-dot {
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    display: inline-block;
+  }
+
+  /* Link Budget Table */
+  .budget-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-family: var(--font-mono);
+    font-size: 11px;
+  }
+  .budget-table th, .budget-table td {
+    padding: 3px 6px;
+    border-bottom: 1px solid rgba(29, 56, 84, 0.45);
+    text-align: left;
+  }
+  .budget-table td.num {
+    text-align: right;
+    font-weight: 600;
+  }
+  .verdict-box {
+    padding: 6px 8px;
+    border-radius: 3px;
+    font-family: var(--font-mono);
+    font-size: 11px;
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+  }
+  .verdict-box.ok {
+    background: rgba(0, 245, 155, 0.1);
+    border: 1px solid var(--green);
+    color: var(--green);
+  }
+  .verdict-box.fail {
+    background: rgba(255, 59, 92, 0.12);
+    border: 1px solid var(--red);
+    color: #ff8096;
+  }
+  .verdict-box.warn {
+    background: rgba(255, 184, 0, 0.12);
+    border: 1px solid var(--amber);
+    color: var(--amber);
+  }
+</style>
+</head>
+<body>
+
+<!-- ==================== TOP HEADER & MODE BAR ==================== -->
+<header class="top-header">
+  <div class="brand">
+    <span class="brand-badge">AN/APG-81X AESA</span>
+    <div>
+      <div class="brand-title">机载有源相控阵火控雷达模拟器 (全物理闭环引擎)</div>
+      <div class="brand-sub">IEEE X-Band (8.0–12.0 GHz) · 千级阵元方向图实时合成 · FFT脉冲压缩 · 扫描波束空间照明 · 雷达方程/CFAR/M-of-N判决</div>
+    </div>
+  </div>
+
+  <div class="mode-bar" id="modeBar">
+    <button class="mode-btn active" data-mode="RWS" title="Range While Search 边测距边搜索">RWS</button>
+    <button class="mode-btn" data-mode="TWS" title="Track While Scan 边扫描边跟踪">TWS</button>
+    <button class="mode-btn" data-mode="TAS" title="Track And Search 敏捷波束穿插跟踪搜索">TAS</button>
+    <button class="mode-btn" data-mode="MTT" title="Multi-Target Track 多目标重点时分跟踪">MTT</button>
+    <button class="mode-btn" data-mode="DTT" title="Dual Target Track 双目标高更新率跟踪">DTT</button>
+    <button class="mode-btn" data-mode="STT" title="Single Target Track 单目标连续驻留单脉冲精密锁定">STT</button>
+    <button class="mode-btn" data-mode="ACM" title="Air Combat Mode 近距空战宽波束自动截获">ACM</button>
+    <button class="mode-btn" data-mode="GMTI" title="Ground Moving Target Indicator 地面动目标检测 (DPCA)">GMTI</button>
+    <button class="mode-btn" data-mode="GM" title="Ground Map 实波束地面测绘">GM</button>
+    <button class="mode-btn" data-mode="SAR" title="Synthetic Aperture Radar 合成孔径高分辨成像">SAR</button>
+  </div>
+
+  <div class="sim-controls">
+    <select id="scenarioSelect" class="compact-select" title="加载预设战术对抗验证想定">
+      <option value="default">想定 1: 多批次空地综合态势 (默认)</option>
+      <option value="stealth">想定 2: 远距 VLO 隐身目标突防 (需大脉宽/大CPI/对准扇区)</option>
+      <option value="jam_adbf">想定 3: 强噪声压制支援干扰 (需开启 ADBF 方向图零陷)</option>
+      <option value="drfm_rgpo">想定 4: 自卫 DRFM 距离拖引假目标 (需切换 Costas 波形 + 前沿跟踪)</option>
+      <option value="gmti_convoy">想定 5: 下视强地杂波 + 地面装甲车队 (需切换 GMTI / 开启 DPCA)</option>
+      <option value="acm_dogfight">想定 6: 近距大离轴角高G格斗 (需切换 ACM 唯相展宽自动锁定)</option>
+      <option value="rain_xband">想定 7: 强降雨衰减与全 X 波段 (8~12 GHz) 频点优选</option>
+    </select>
+    <button class="btn primary" id="btnPause">暂停</button>
+    <button class="btn" id="btnStep" title="单步执行一次波束驻留 (1 Dwell)">单步驻留</button>
+    <select id="speedSelect" class="compact-select" title="仿真倍速">
+      <option value="0.5">0.5x 慢放</option>
+      <option value="1" selected>1.0x 实时</option>
+      <option value="2">2.0x 加速</option>
+      <option value="4">4.0x 快进</option>
+    </select>
+    <button class="btn warn" id="btnReset">重置态势</button>
+  </div>
+</header>
+
+<!-- ==================== LIVE PHYSICS TELEMETRY STRIP ==================== -->
+<section class="telemetry-strip">
+  <div class="tele-item">
+    <span class="tele-label">工作频点 / 波长 (X-Band)</span>
+    <span class="tele-val" id="teleFreq">10.00 GHz / 3.00 cm</span>
+  </div>
+  <div class="tele-item">
+    <span class="tele-label">有效阵元 / 发射峰值与平均功率</span>
+    <span class="tele-val" id="telePower">1519 TR / 15.2 kW</span>
+  </div>
+  <div class="tele-item">
+    <span class="tele-label">占空比 / 发射机状态</span>
+    <span class="tele-val ok" id="teleDuty">30.6% (NORMAL)</span>
+  </div>
+  <div class="tele-item">
+    <span class="tele-label">阵面主瓣增益 Gt / Gr</span>
+    <span class="tele-val" id="teleGain">36.4 / 35.1 dBi</span>
+  </div>
+  <div class="tele-item">
+    <span class="tele-label">双程波束宽度 HPBW / 副瓣</span>
+    <span class="tele-val" id="teleBeam">2.18° / -35.2 dB</span>
+  </div>
+  <div class="tele-item">
+    <span class="tele-label">脉压距离分辨率 ΔR / 失配</span>
+    <span class="tele-val" id="teleRes">9.75 m / 1.34 dB</span>
+  </div>
+  <div class="tele-item">
+    <span class="tele-label">PRF 组 / 不模糊距离 Ru</span>
+    <span class="tele-val" id="telePrf">11/13/17 kHz</span>
+  </div>
+  <div class="tele-item">
+    <span class="tele-label">扫描帧周期 / 波束位</span>
+    <span class="tele-val" id="teleScan">124 位 / 1.62 s</span>
+  </div>
+  <div class="tele-item">
+    <span class="tele-label">点迹 / 确认航迹 / 锁定</span>
+    <span class="tele-val ok" id="teleTracks">0 点 / 0 批 / 无</span>
+  </div>
+</section>
+
+<!-- ==================== 3-COLUMN WORKBENCH ==================== -->
+<main class="workbench">
+
+  <!-- ==================== LEFT COLUMN: MFD & 2D SCAN FOOTPRINT ==================== -->
+  <div class="col">
+    <!-- Tactical MFD Panel -->
+    <div class="panel">
+      <div class="panel-hdr">
+        <div class="panel-title">
+          <span class="dot"></span>
+          <span>机载火控雷达战术多功能显示器 (FCR MFD)</span>
+        </div>
+        <div style="display:flex;gap:4px;align-items:center;">
+          <button class="chip active" data-view="bscope" id="viewBscope">B-Scope</button>
+          <button class="chip" data-view="ppi" id="viewPpi">PPI扇区</button>
+          <button class="chip" data-view="hud" id="viewHud">HUD角空间</button>
+          <button class="chip" data-view="sar" id="viewSar">SAR/GM成像</button>
+        </div>
+      </div>
+      <div class="panel-body">
+        <div class="mfd-bezel">
+          <div></div>
+          <!-- Top OSB 1-5 -->
+          <div class="osb-row">
+            <button class="osb-btn" id="osbMode" title="循环切换主模式">RWS</button>
+            <button class="osb-btn" id="osbAz" title="切换方位扫描扇区半宽">±60°</button>
+            <button class="osb-btn" id="osbBars" title="切换俯仰扫描行数">4B</button>
+            <button class="osb-btn" id="osbPrf" title="切换PRF体制">MPRF</button>
+            <button class="osb-btn" id="osbFreq" title="快速切换X波段频点">10.0G</button>
+          </div>
+          <div></div>
+
+          <!-- Left OSB 16-20 -->
+          <div class="osb-col">
+            <button class="osb-btn" id="osbRngUp" title="增大量程">R+</button>
+            <button class="osb-btn" id="osbRngDn" title="减小量程">R-</button>
+            <button class="osb-btn" id="osbElUp" title="抬高扫描俯仰中心">EL+</button>
+            <button class="osb-btn" id="osbElDn" title="压低扫描俯仰中心">EL-</button>
+            <button class="osb-btn" id="osbTruth" title="显示/隐藏真值参考标识">TRU</button>
+          </div>
+
+          <!-- Center MFD Screen -->
+          <div class="mfd-screen-wrap">
+            <canvas id="mfdCanvas" class="full-canvas" width="520" height="520"></canvas>
+          </div>
+
+          <!-- Right OSB 6-10 -->
+          <div class="osb-col">
+            <button class="osb-btn" id="osbLock" title="自动锁定最强确认航迹 (STT)">LCK</button>
+            <button class="osb-btn" id="osbBrk" title="解除锁定返回搜索">BRK</button>
+            <button class="osb-btn" id="osbAdbf" title="ADBF自适应方向图零陷">ADBF</button>
+            <button class="osb-btn" id="osbAgil" title="全X波段脉间捷变频">AGIL</button>
+            <button class="osb-btn" id="osbDpca" title="DPCA双子孔径动目标相消">DPCA</button>
+          </div>
+
+          <div></div>
+          <!-- Bottom OSB 11-15 -->
+          <div class="osb-row">
+            <button class="osb-btn" id="osbWf" title="切换发射波形 LFM/Barker/Costas">LFM</button>
+            <button class="osb-btn" id="osbTaper" title="切换接收阵面口径加权">LOWS</button>
+            <button class="osb-btn" id="osbLe" title="前沿跟踪抗RGPO">LE</button>
+            <button class="osb-btn" id="osbSlb" title="旁瓣消隐SLB">SLB</button>
+            <button class="osb-btn" id="osbSlew" title="点击屏幕挪动扫描扇区中心">SLEW</button>
+          </div>
+          <div></div>
+        </div>
+        <div style="display:flex;justify-content:space-between;font-size:10px;color:var(--txt-dim);">
+          <span>提示: 点击 MFD 上的目标/航迹可切换选中并锁定；开启 [SLEW] 后点击空白处可平移扫描扇区。</span>
+          <span id="mfdCursorInfo" style="font-family:var(--font-mono);color:var(--cyan);">R: -- km | Az: --°</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- 2D Scan Pattern & Target Spatial Matching Panel -->
+    <div class="panel">
+      <div class="panel-hdr">
+        <div class="panel-title">
+          <span class="dot" style="background:var(--cyan);box-shadow:0 0 6px var(--cyan);"></span>
+          <span>扫描图形 (Scan Pattern) 与波束脚印空间匹配视图 (Az × El)</span>
+        </div>
+        <span id="scanMatchBadge" style="font-family:var(--font-mono);font-size:10px;color:var(--green);">波束覆盖正常</span>
+      </div>
+      <div class="panel-body">
+        <div class="canvas-box" style="height:195px;">
+          <canvas id="scanCanvas" class="full-canvas" width="520" height="210"></canvas>
+        </div>
+        <div style="font-size:10px;color:var(--txt-dim);display:flex;justify-content:space-between;">
+          <span>椭圆代表各驻留波束的实际 3dB 脚印 (由当前阵面口径与频点决定)；点击任意位置可直接将扫描中心对准该方向。</span>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ==================== CENTER COLUMN: ARRAY, PATTERN & SIGNAL PROCESSING ==================== -->
+  <div class="col">
+    <!-- Row 1: AESA Aperture + Real-Time Synthesized Antenna Radiation Pattern -->
+    <div class="panel">
+      <div class="panel-hdr">
+        <div class="panel-title">
+          <span class="dot"></span>
+          <span>AESA 阵面口径激励分布 & 实时合成远场天线方向图 (与雷达方程同源增益)</span>
+        </div>
+        <div style="display:flex;gap:4px;align-items:center;">
+          <button class="chip active" id="btnCutAz">方位切面 Az</button>
+          <button class="chip" id="btnCutEl">俯仰切面 El</button>
+          <button class="chip" id="btnPat2D">2D (u,v) 方向图</button>
+          <button class="chip active" id="btnPatSteer" title="切换方向图按当前扫描波束指向或对准选中目标">指向: 选中目标</button>
+        </div>
+      </div>
+      <div class="panel-body">
+        <div class="signal-grid-top">
+          <!-- Circular AESA Aperture TR Elements -->
+          <div class="canvas-box" style="height:235px;">
+            <canvas id="arrayCanvas" class="full-canvas" width="250" height="250"></canvas>
+          </div>
+          <!-- Synthesized Far-Field Antenna Pattern -->
+          <div class="canvas-box" style="height:235px;">
+            <canvas id="patternCanvas" class="full-canvas" width="580" height="250"></canvas>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Row 2: Transmit Waveform & FFT Matched Filter Pulse Compression -->
+    <div class="panel">
+      <div class="panel-hdr">
+        <div class="panel-title">
+          <span class="dot" style="background:var(--amber);box-shadow:0 0 6px var(--amber);"></span>
+          <span>发射基带调制波形 I/Q · 瞬时频率 f(t) · 真实 FFT 匹配滤波脉冲压缩输出</span>
+        </div>
+        <span id="wfInfoBadge" style="font-family:var(--font-mono);font-size:10px;color:var(--amber);">LFM | τ=18μs | B=20MHz | TBP=360</span>
+      </div>
+      <div class="panel-body">
+        <div class="canvas-box" style="height:175px;">
+          <canvas id="waveCanvas" class="full-canvas" width="820" height="190"></canvas>
+        </div>
+      </div>
+    </div>
+
+    <!-- Row 3: Live A-Scope + CA-CFAR & 2D Range-Doppler Map -->
+    <div class="panel">
+      <div class="panel-hdr">
+        <div class="panel-title">
+          <span class="dot" style="background:var(--purple);box-shadow:0 0 6px var(--purple);"></span>
+          <span>距离维脉压回波包络 (A-Scope + 滑动窗 CA-CFAR 门限) & 二维距离-多普勒谱 (R-D Map)</span>
+        </div>
+        <span id="cfarInfoBadge" style="font-family:var(--font-mono);font-size:10px;color:var(--cyan);">CA-CFAR Nref=32 | M-of-N: 2/3</span>
+      </div>
+      <div class="panel-body">
+        <div class="signal-grid-bot">
+          <div class="canvas-box" style="height:205px;">
+            <canvas id="ascopeCanvas" class="full-canvas" width="420" height="220"></canvas>
+          </div>
+          <div class="canvas-box" style="height:205px;">
+            <canvas id="rdCanvas" class="full-canvas" width="420" height="220"></canvas>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ==================== RIGHT COLUMN: PARAMETER EDITORS & LINK BUDGET ==================== -->
+  <div class="col">
+    <!-- Tabbed Parameter Editor Panel -->
+    <div class="panel">
+      <div class="tab-bar">
+        <button class="tab-btn active" data-tab="tabRadar">1. 雷达/波形/阵面设置</button>
+        <button class="tab-btn" data-tab="tabTarget">2. 目标运动/RCS/干扰设置</button>
+        <button class="tab-btn" data-tab="tabScan">3. 扫描图形/环境/ECCM</button>
+      </div>
+
+      <!-- TAB 1: RADAR, WAVEFORM & ARRAY PARAMETERS -->
+      <div class="tab-pane active" id="tabRadar">
+        <div class="sec-hdr">
+          <span>IEEE X 波段全频段调谐 (8.00 – 12.00 GHz)</span>
+          <span id="lblFreqBand" style="font-family:var(--font-mono);font-size:10px;color:var(--green);">λ = 3.00 cm</span>
+        </div>
+        <div class="ctrl-grid">
+          <div class="ctrl-item span2">
+            <div class="ctrl-lbl">
+              <span>载波中心频率 f₀ (覆盖完整 X 波段 8.0~12.0 GHz)</span>
+              <span class="ctrl-val" id="valFGHz">10.00 GHz</span>
+            </div>
+            <input type="range" id="inpFGHz" min="8.0" max="12.0" step="0.05" value="10.0">
+            <div class="chip-row" style="margin-top:3px;">
+              <button class="chip freq-preset" data-f="8.0">8.0 GHz (雨衰最小)</button>
+              <button class="chip freq-preset" data-f="9.0">9.0 GHz</button>
+              <button class="chip freq-preset active" data-f="10.0">10.0 GHz (标准火控)</button>
+              <button class="chip freq-preset" data-f="11.0">11.0 GHz</button>
+              <button class="chip freq-preset" data-f="12.0">12.0 GHz (最高增益/窄波束)</button>
+            </div>
+          </div>
+        </div>
+
+        <div class="sec-hdr"><span>发射波形、脉冲压缩与 PRF 体制</span></div>
+        <div class="ctrl-grid">
+          <div class="ctrl-item">
+            <div class="ctrl-lbl"><span>发射脉内调制波形</span></div>
+            <select id="inpWaveform" class="form-select">
+              <option value="lfm">LFM 线性调频 (Chirp)</option>
+              <option value="barker">Barker-13 二相编码</option>
+              <option value="costas">Welch-Costas 跳频码 (抗DRFM)</option>
+            </select>
+          </div>
+          <div class="ctrl-item">
+            <div class="ctrl-lbl"><span>脉压旁瓣加权窗</span></div>
+            <select id="inpWindow" class="form-select">
+              <option value="hamming">Hamming (-42dB 旁瓣)</option>
+              <option value="blackman">Blackman (-58dB 旁瓣)</option>
+              <option value="none">Rectangular (无加权/最窄主瓣)</option>
+            </select>
+          </div>
+          <div class="ctrl-item">
+            <div class="ctrl-lbl"><span>脉冲宽度 τp</span><span class="ctrl-val" id="valTau">18 μs</span></div>
+            <input type="range" id="inpTau" min="1" max="60" step="1" value="18">
+          </div>
+          <div class="ctrl-item">
+            <div class="ctrl-lbl"><span>调制带宽 B</span><span class="ctrl-val" id="valBw">20 MHz</span></div>
+            <input type="range" id="inpBw" min="2" max="300" step="2" value="20">
+          </div>
+          <div class="ctrl-item">
+            <div class="ctrl-lbl"><span>脉冲重复频率体制 (PRF)</span></div>
+            <select id="inpPrfRegime" class="form-select">
+              <option value="lprf">LPRF 低重频 (2.5 kHz 距离无模糊)</option>
+              <option value="mprf1">MPRF 单重频 (15 kHz)</option>
+              <option value="mprf3" selected>MPRF 3重频参差 (11/13/17 kHz CRT解模糊)</option>
+              <option value="mprf8">MPRF 4重频组 (11/12.7/14.3/17 kHz)</option>
+              <option value="hprf3">HPRF 高重频组 (120/133/145 kHz 迎头速度无模糊)</option>
+              <option value="acm">ACM 空战重频 (8.1 kHz)</option>
+            </select>
+          </div>
+          <div class="ctrl-item">
+            <div class="ctrl-lbl"><span>M-of-N 参差证实准则</span><span class="ctrl-val" id="valMofN">2 / 3</span></div>
+            <input type="range" id="inpMofN" min="1" max="4" step="1" value="2">
+          </div>
+          <div class="ctrl-item">
+            <div class="ctrl-lbl"><span>单驻留相参脉冲数 Ncpi</span><span class="ctrl-val" id="valNcpi">48 脉冲</span></div>
+            <input type="range" id="inpNcpi" min="8" max="128" step="8" value="48">
+          </div>
+          <div class="ctrl-item">
+            <div class="ctrl-lbl"><span>单TR组件峰值功率 Pt,elem</span><span class="ctrl-val" id="valTrW">10 W</span></div>
+            <input type="range" id="inpTrW" min="2" max="25" step="1" value="10">
+          </div>
+        </div>
+
+        <div class="sec-hdr"><span>有源相控阵天线阵面形式 (Array Aperture & Taper)</span></div>
+        <div class="ctrl-grid">
+          <div class="ctrl-item">
+            <div class="ctrl-lbl"><span>阵面排布栅格拓扑</span></div>
+            <select id="inpGrid" class="form-select">
+              <option value="triangular" selected>正三角形栅格 (Triangular 最高填充)</option>
+              <option value="rectangular">矩形栅格 (Rectangular)</option>
+              <option value="concentric">同心圆环栅格 (Concentric Ring)</option>
+            </select>
+          </div>
+          <div class="ctrl-item">
+            <div class="ctrl-lbl"><span>接收口径赋形加权</span></div>
+            <select id="inpTaper" class="form-select">
+              <option value="lowsll" selected>Taylor 圆口径低副瓣 (<-35dB)</option>
+              <option value="uniform">Uniform 均匀加权 (最高增益)</option>
+              <option value="spoil">Quadratic 唯相平方律展宽 (ACM)</option>
+              <option value="diffAz">Bayliss 方位单脉冲差波束 ΔAz</option>
+              <option value="diffEl">Bayliss 俯仰单脉冲差波束 ΔEl</option>
+            </select>
+          </div>
+          <div class="ctrl-item">
+            <div class="ctrl-lbl"><span>天线口径直径 D</span><span class="ctrl-val" id="valDiam">0.70 m</span></div>
+            <input type="range" id="inpDiam" min="0.40" max="1.00" step="0.05" value="0.70">
+          </div>
+          <div class="ctrl-item">
+            <div class="ctrl-lbl"><span>阵元间距 d / λ₁₀GHz</span><span class="ctrl-val" id="valSpacing">0.61 λ</span></div>
+            <input type="range" id="inpSpacing" min="0.48" max="0.72" step="0.01" value="0.61">
+          </div>
+          <div class="ctrl-item">
+            <div class="ctrl-lbl"><span>TR 组件随机失效比例</span><span class="ctrl-val" id="valFail">0%</span></div>
+            <input type="range" id="inpFail" min="0" max="0.25" step="0.01" value="0">
+          </div>
+          <div class="ctrl-item">
+            <div class="ctrl-lbl"><span>移相器量化位数</span><span class="ctrl-val" id="valBits">6 bits</span></div>
+            <input type="range" id="inpBits" min="3" max="8" step="1" value="6">
+          </div>
+        </div>
+      </div>
+
+      <!-- TAB 2: TARGET KINEMATICS, RCS & JAMMER EDITOR -->
+      <div class="tab-pane" id="tabTarget">
+        <div class="sec-hdr">
+          <span>多目标管理与选中目标运动学/散射参数</span>
+          <div style="display:flex;gap:4px;">
+            <button class="btn primary" id="btnAddTarget" style="padding:2px 6px;font-size:10px;">+ 新增目标</button>
+            <button class="btn danger" id="btnDelTarget" style="padding:2px 6px;font-size:10px;">删除当前</button>
+          </div>
+        </div>
+        <div class="entity-list" id="targetListBar"></div>
+
+        <div class="ctrl-grid">
+          <div class="ctrl-item">
+            <div class="ctrl-lbl"><span>目标代号 / 名称</span></div>
+            <input type="text" id="tgName" value="T1">
+          </div>
+          <div class="ctrl-item">
+            <div class="ctrl-lbl"><span>目标所处空间域</span></div>
+            <select id="tgDomain" class="form-select">
+              <option value="air">空中机动目标 (Air)</option>
+              <option value="ground">地面/海面移动目标 (Ground)</option>
+            </select>
+          </div>
+          <div class="ctrl-item">
+            <div class="ctrl-lbl"><span>当前斜距 R (km)</span><span class="ctrl-val" id="valTgR">75.0 km</span></div>
+            <input type="range" id="inpTgR" min="3" max="280" step="1" value="75">
+          </div>
+          <div class="ctrl-item">
+            <div class="ctrl-lbl"><span>当前方位角 Az (°)</span><span class="ctrl-val" id="valTgAz">-15.0°</span></div>
+            <input type="range" id="inpTgAz" min="-75" max="75" step="0.5" value="-15">
+          </div>
+          <div class="ctrl-item">
+            <div class="ctrl-lbl"><span>当前海拔高度 H (m)</span><span class="ctrl-val" id="valTgAlt">8500 m</span></div>
+            <input type="range" id="inpTgAlt" min="0" max="20000" step="100" value="8500">
+          </div>
+          <div class="ctrl-item">
+            <div class="ctrl-lbl"><span>飞行/移动速度 v (m/s)</span><span class="ctrl-val" id="valTgSpd">280 m/s</span></div>
+            <input type="range" id="inpTgSpd" min="0" max="850" step="5" value="280">
+          </div>
+          <div class="ctrl-item">
+            <div class="ctrl-lbl"><span>移动方向/航向角 ψ (180°迎头)</span><span class="ctrl-val" id="valTgHdg">180°</span></div>
+            <input type="range" id="inpTgHdg" min="0" max="360" step="1" value="180">
+          </div>
+          <div class="ctrl-item">
+            <div class="ctrl-lbl"><span>垂直爬升率 vz (m/s)</span><span class="ctrl-val" id="valTgClimb">0 m/s</span></div>
+            <input type="range" id="inpTgClimb" min="-80" max="80" step="2" value="0">
+          </div>
+          <div class="ctrl-item">
+            <div class="ctrl-lbl"><span>雷达散射截面积 RCS σ</span><span class="ctrl-val" id="valTgRcs">3.00 m²</span></div>
+            <input type="number" id="inpTgRcs" min="0.0001" max="500" step="0.01" value="3.0">
+          </div>
+          <div class="ctrl-item">
+            <div class="ctrl-lbl"><span>Swerling 起伏模型</span></div>
+            <select id="inpTgSw" class="form-select">
+              <option value="0">Swerling 0 (无起伏定常目标)</option>
+              <option value="1" selected>Swerling I (扫描间慢起伏)</option>
+              <option value="2">Swerling II (脉冲间快起伏)</option>
+            </select>
+          </div>
+          <div class="ctrl-item span2">
+            <div class="ctrl-lbl"><span>典型目标 RCS 快速注入预设</span></div>
+            <div class="chip-row">
+              <button class="chip rcs-preset" data-rcs="0.001">0.001 m² (VLO五代隐身)</button>
+              <button class="chip rcs-preset" data-rcs="0.05">0.05 m² (隐身巡航导弹)</button>
+              <button class="chip rcs-preset" data-rcs="1.2">1.2 m² (轻型战机)</button>
+              <button class="chip rcs-preset" data-rcs="5.0">5.0 m² (典型四代战机)</button>
+              <button class="chip rcs-preset" data-rcs="30.0">30 m² (大型运输/轰炸机)</button>
+            </div>
+          </div>
+        </div>
+
+        <div class="sec-hdr">
+          <span>电子对抗干扰源 (Jammers) 设置</span>
+          <div style="display:flex;gap:4px;">
+            <button class="btn primary" id="btnAddJam" style="padding:2px 6px;font-size:10px;">+ 新增干扰</button>
+            <button class="btn danger" id="btnDelJam" style="padding:2px 6px;font-size:10px;">删除干扰</button>
+          </div>
+        </div>
+        <div class="entity-list" id="jammerListBar"></div>
+        <div class="ctrl-grid" id="jammerEditorGrid">
+          <div class="ctrl-item">
+            <div class="ctrl-lbl"><span>干扰样式</span></div>
+            <select id="jamType" class="form-select">
+              <option value="spot">Spot 窄带瞄准噪声压制</option>
+              <option value="barrage">Barrage 4GHz宽带阻塞噪声</option>
+              <option value="drfm">DRFM 距离拖引欺骗 (RGPO)</option>
+              <option value="pulse">Pulse 旁瓣异步高功率脉冲</option>
+            </select>
+          </div>
+          <div class="ctrl-item">
+            <div class="ctrl-lbl"><span>等效辐射功率 ERP</span><span class="ctrl-val" id="valJamErp">42 dBW</span></div>
+            <input type="range" id="inpJamErp" min="15" max="65" step="1" value="42">
+          </div>
+          <div class="ctrl-item">
+            <div class="ctrl-lbl"><span>干扰源方位角 Az (°)</span><span class="ctrl-val" id="valJamAz">22°</span></div>
+            <input type="range" id="inpJamAz" min="-70" max="70" step="1" value="22">
+          </div>
+          <div class="ctrl-item">
+            <div class="ctrl-lbl"><span>干扰瞄准频点</span><span class="ctrl-val" id="valJamFreq">10.0 GHz</span></div>
+            <input type="range" id="inpJamFreq" min="8.0" max="12.0" step="0.1" value="10.0">
+          </div>
+          <div class="ctrl-item">
+            <div class="ctrl-lbl"><span>干扰源距离</span><span class="ctrl-val" id="valJamRng">90 km</span></div>
+            <input type="range" id="inpJamRng" min="5" max="300" step="5" value="90">
+          </div>
+          <div class="ctrl-item">
+            <div class="ctrl-lbl"><span>干扰源俯仰角</span><span class="ctrl-val" id="valJamEl">0°</span></div>
+            <input type="range" id="inpJamEl" min="-30" max="30" step="1" value="0">
+          </div>
+          <div class="ctrl-item">
+            <div class="ctrl-lbl"><span>干扰带宽</span><span class="ctrl-val" id="valJamBw">25 MHz</span></div>
+            <input type="range" id="inpJamBw" min="1" max="200" step="1" value="25">
+          </div>
+        </div>
+      </div>
+
+      <!-- TAB 3: SCAN GEOMETRY, ENVIRONMENT & ECCM -->
+      <div class="tab-pane" id="tabScan">
+        <div class="sec-hdr">
+          <span>扫描图形几何参数 (Scan Raster Geometry)</span>
+          <button class="btn primary" id="btnAlignScanToTarget" style="padding:2px 6px;font-size:10px;">一键将扫描扇区对准选中目标</button>
+        </div>
+        <div class="ctrl-grid">
+          <div class="ctrl-item">
+            <div class="ctrl-lbl"><span>扫描方位中心 Az₀</span><span class="ctrl-val" id="valScanAz0">0°</span></div>
+            <input type="range" id="inpScanAz0" min="-60" max="60" step="1" value="0">
+          </div>
+          <div class="ctrl-item">
+            <div class="ctrl-lbl"><span>扫描方位半宽 ±ΔAz</span><span class="ctrl-val" id="valScanAzHalf">±60°</span></div>
+            <input type="range" id="inpScanAzHalf" min="5" max="70" step="5" value="60">
+          </div>
+          <div class="ctrl-item">
+            <div class="ctrl-lbl"><span>扫描俯仰中心 El₀</span><span class="ctrl-val" id="valScanEl0">0°</span></div>
+            <input type="range" id="inpScanEl0" min="-25" max="25" step="0.5" value="0">
+          </div>
+          <div class="ctrl-item">
+            <div class="ctrl-lbl"><span>俯仰扫描行数 (Bars)</span><span class="ctrl-val" id="valScanBars">4 行</span></div>
+            <input type="range" id="inpScanBars" min="1" max="8" step="1" value="4">
+          </div>
+          <div class="ctrl-item">
+            <div class="ctrl-lbl"><span>显示器最大距离量程</span><span class="ctrl-val" id="valRngMax">160 km</span></div>
+            <input type="range" id="inpRngMax" min="20" max="300" step="20" value="160">
+          </div>
+          <div class="ctrl-item">
+            <div class="ctrl-lbl"><span>载机高度</span><span class="ctrl-val" id="valOwnInfo">8000 m</span></div>
+            <input type="range" id="inpOwnAlt" min="1000" max="15000" step="500" value="8000">
+          </div>
+          <div class="ctrl-item">
+            <div class="ctrl-lbl"><span>载机速度</span><span class="ctrl-val" id="valOwnSpd">250 m/s</span></div>
+            <input type="range" id="inpOwnSpd" min="100" max="600" step="10" value="250">
+          </div>
+        </div>
+
+        <div class="sec-hdr"><span>大气降雨衰减 (ITU-R P.838)、杂波与接收机</span></div>
+        <div class="ctrl-grid">
+          <div class="ctrl-item">
+            <div class="ctrl-lbl"><span>降雨率 Rain (mm/h)</span><span class="ctrl-val" id="valRain">0 mm/h</span></div>
+            <input type="range" id="inpRain" min="0" max="50" step="2" value="0">
+          </div>
+          <div class="ctrl-item">
+            <div class="ctrl-lbl"><span>接收机噪声系数 NF</span><span class="ctrl-val" id="valNf">3.2 dB</span></div>
+            <input type="range" id="inpNf" min="1.5" max="8.0" step="0.1" value="3.2">
+          </div>
+          <div class="ctrl-item">
+            <div class="ctrl-lbl"><span>主瓣地杂波与STC控制</span></div>
+            <div class="chip-row" style="margin-top:2px;">
+              <button class="chip active" id="btnClutterToggle">主瓣地杂波: 开启</button>
+              <button class="chip active" id="btnStcToggle">近程STC衰减: 开启</button>
+            </div>
+          </div>
+          <div class="ctrl-item">
+            <div class="ctrl-lbl"><span>系统虚警率 Pfa</span><span class="ctrl-val" id="valPfa">1e-9</span></div>
+            <select id="inpPfa" class="form-select">
+              <option value="1e-6">1e-6 (低门限/高灵敏度)</option>
+              <option value="1e-8">1e-8 (标准门限)</option>
+              <option value="1e-9" selected>1e-9 (严苛低虚警)</option>
+              <option value="1e-10">1e-10 (极高门限)</option>
+            </select>
+          </div>
+        </div>
+
+        <div class="sec-hdr"><span>电子反对抗 (ECCM) 算法开关</span></div>
+        <div class="chip-row">
+          <button class="chip eccm" id="eccmAdbf">ADBF (MVDR自适应方向图零陷)</button>
+          <button class="chip eccm" id="eccmAgil">Freq Agility (8~12GHz脉间捷变)</button>
+          <button class="chip eccm" id="eccmDpca">DPCA (双子孔径杂波相消)</button>
+          <button class="chip eccm" id="eccmLe">Leading-Edge (前沿跟踪抗RGPO)</button>
+          <button class="chip eccm" id="eccmSlb">SLB (保护通道旁瓣消隐)</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Real-Time Radar Equation Link Budget & Scan-Match Diagnostic Panel -->
+    <div class="panel">
+      <div class="panel-hdr">
+        <div class="panel-title">
+          <span class="dot" style="background:var(--green);"></span>
+          <span>雷达方程链路预算与扫描空间匹配实时解算表</span>
+        </div>
+        <span id="diagTargetBadge" style="font-family:var(--font-mono);font-size:11px;color:var(--cyan);font-weight:700;">诊断目标: T1</span>
+      </div>
+      <div class="panel-body">
+        <div id="verdictContainer" class="verdict-box ok">
+          <div style="font-weight:700;" id="verdictTitle">状态: OK — 满足雷达方程与扫描波束照明条件</div>
+          <div id="verdictReason" style="font-size:10px;">正在解算...</div>
+        </div>
+
+        <table class="budget-table">
+          <tbody>
+            <tr>
+              <td>目标瞬时空间坐标 (斜距 / 方位 / 俯仰)</td>
+              <td class="num" id="bgPos">--</td>
+            </tr>
+            <tr>
+              <td>径向闭合速度 Vr / 多普勒频移 fd</td>
+              <td class="num" id="bgDop">--</td>
+            </tr>
+            <tr>
+              <td>单脉冲能量 × 相参积累 (Pt · τp · Ncpi)</td>
+              <td class="num" id="bgEnergy">--</td>
+            </tr>
+            <tr>
+              <td>阵面合成增益 Gt(θ) + Gr(θ) [方向图同源]</td>
+              <td class="num" id="bgGain">--</td>
+            </tr>
+            <tr>
+              <td>扫描波束网格偏角 Δθscan / 扫描失配损耗</td>
+              <td class="num" id="bgScanLoss">--</td>
+            </tr>
+            <tr>
+              <td>波长与目标散射项 10lg(λ² · σRCS)</td>
+              <td class="num" id="bgRcsTerm">--</td>
+            </tr>
+            <tr>
+              <td>双程自由空间扩散损耗 10lg((4π)³R⁴)</td>
+              <td class="num" id="bgSpread">--</td>
+            </tr>
+            <tr>
+              <td>大气/降雨/接收/脉压/STC/遮蔽总损耗</td>
+              <td class="num" id="bgLosses">--</td>
+            </tr>
+            <tr>
+              <td>干扰+杂波引起的噪声基底抬升 ΔN</td>
+              <td class="num" id="bgNoiseRaise">--</td>
+            </tr>
+            <tr style="border-top:1px solid var(--border-hi);">
+              <td style="color:var(--cyan);font-weight:700;">单驻留净信干噪比 SINRburst vs 门限</td>
+              <td class="num" id="bgSinr" style="color:var(--cyan);">--</td>
+            </tr>
+            <tr>
+              <td style="color:var(--green);font-weight:700;">检测概率 Pd(单次) / Pd,sys(M-of-N) / Rmax</td>
+              <td class="num" id="bgPd" style="color:var(--green);">--</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+</main>
+
+<script src="radar_engine.js"></script>
+<script src="simulator_app.js"></script>
+</body>
+</html>
