@@ -2,8 +2,14 @@
  * radar_engine.js — AESA 火控雷达物理/信号引擎 (浏览器与 Node 共用，测试直接测本文件)
  *
  * 核心原则：目标能否被探测，完全由
- *   阵面几何+权值 → 方向图增益(目标方向) → 雷达方程(含大气/降雨/STC/遮蔽/杂波/干扰) → 检测统计(CA-CFAR, M-of-N)
+ *   阵面几何+权值 → 方向图增益(目标方向) → 雷达方程(含大气/降雨/STC/遮蔽/杂波/干扰) → 检测统计(CA/OS-CFAR, M-of-N)
  * 计算得出，不存在任何"按场景写死"的判决。
+ *
+ * 增强特性：
+ * 1. 全闭环状态自动切换 (RWS <-> TWS <-> TAS <-> MTT/DTT <-> ACM/STT 及 GMTI <-> GMTT，支持自动/手动切换)
+ * 2. 目标探测状态严格分级 (UNDETECTED / ACQUIRING / TRACKED / LOCKED / COASTING / DECEIVED)，未检出目标严格不显示
+ * 3. 未检出原因深度物理诊断与一键可执行措施建议 (覆盖 14 类细分物理原因与自适应对策)
+ * 4. 完备电子对抗 (ECM: Spot/Barrage/Swept/DRFM-RGPO/VGPO/RVGPO/Pulse/Chaff) 与反对抗 (ECCM: ADBF/Agility/DPCA/LeadingEdge/SLB/OS-CFAR/DopplerGate/MTD-Notch/BurnThrough/Auto-ECCM)
  */
 (function (root, factory) {
   if (typeof module === 'object' && module.exports) module.exports = factory();
@@ -216,7 +222,6 @@ function monopulseEval(arr, w, fGHz, az, el) {
   const dar = (qr[0] + qr[3]) - (qr[1] + qr[2]), dai = (qi[0] + qi[3]) - (qi[1] + qi[2]);
   const der = (qr[0] + qr[1]) - (qr[2] + qr[3]), dei = (qi[0] + qi[1]) - (qi[2] + qi[3]);
   const sMag2 = Math.max(sr * sr + si * si, 1e-18);
-  // Im{Δ/Σ} 因阵列空间相位 e^{jkx(u-u0)} 对奇数对称分布表现为虚部奇函数
   const errAz = (dai * sr - dar * si) / sMag2;
   const errEl = (dei * sr - der * si) / sMag2;
   return { sumMag2: sMag2, diffAzMag2: dar * dar + dai * dai, diffElMag2: der * der + dei * dei, errAz, errEl };
@@ -239,14 +244,12 @@ function powerCutLine(arr, w, fGHz, u0, v0, du, dv, n) {
   }
   return g;
 }
-/** 方位切面(固定仰角)，u 等间隔 → 返回角度与线性增益 */
 function cutAz(arr, w, fGHz, el, azMin, azMax, n) {
   const ce = Math.cos(el * DEG), u0 = Math.sin(azMin * DEG) * ce, u1 = Math.sin(azMax * DEG) * ce, du = (u1 - u0) / (n - 1);
   const g = powerCutLine(arr, w, fGHz, u0, Math.sin(el * DEG), du, 0, n), ang = new Float64Array(n);
   for (let j = 0; j < n; j++) ang[j] = Math.asin(clamp((u0 + j * du) / ce, -1, 1)) * RAD;
   return { ang, g };
 }
-/** 俯仰切面(固定 u = 波束 u0) */
 function cutEl(arr, w, fGHz, u, elMin, elMax, n) {
   const v0 = Math.sin(elMin * DEG), v1 = Math.sin(elMax * DEG), dv = (v1 - v0) / (n - 1);
   const g = powerCutLine(arr, w, fGHz, u, v0, 0, dv, n), ang = new Float64Array(n);
@@ -258,7 +261,6 @@ function patternMap(arr, w, fGHz, u0, du, nu, v0, dv, nv) {
   for (let j = 0; j < nv; j++) out.set(powerCutLine(arr, w, fGHz, u0, v0 + j * dv, du, 0, nu), j * nu);
   return out;
 }
-/** 分析切面：峰值、3dB 波束宽度、第一零点、最大副瓣(相对峰值 dB) */
 function analyzeCut(ang, g) {
   const n = ang.length; let pk = 0;
   for (let i = 1; i < n; i++) if (g[i] > g[pk]) pk = i;
@@ -333,7 +335,6 @@ function windowFn(name, n) {
   }
   return w;
 }
-/** 匹配滤波(脉压)输出核：y[m]=Σ s[n+m]·conj(h[n])，h=窗·s。返回以峰值归一的包络、PSLR、分辨率、失配损耗 */
 function matchedFilter(wf, win) {
   const n = wf.n, nf = nextPow2(2 * n), w = windowFn(wf.type === 'lfm' ? (win || 'none') : 'none', n);
   const ar = new Float64Array(nf), ai = new Float64Array(nf), hr = new Float64Array(nf), hi = new Float64Array(nf);
@@ -355,14 +356,13 @@ function matchedFilter(wf, win) {
   let rn = pi; while (rn < L - 1 && env[rn + 1] <= env[rn]) rn++;
   let ln = pi; while (ln > 0 && env[ln - 1] <= env[ln]) ln--;
   let sl = 0; for (let i = rn; i < L; i++) sl = Math.max(sl, env[i]); for (let i = 0; i <= ln; i++) sl = Math.max(sl, env[i]);
-  const width3 = (wR - wL) / wf.fs; // 1/√2 幅度点 = -3dB(功率)
+  const width3 = (wR - wL) / wf.fs;
   return {
     env, centerIdx: pi, dt: 1 / wf.fs, pslrDb: dB(sl * sl + 1e-30), width3dBs: width3,
     rangeRes: C / 2 * width3, mismatchLossDb: -dB(pk * pk / (Es * Eh)), compression: wf.tau * wf.B,
     window: wf.type === 'lfm' ? (win || 'none') : 'none'
   };
 }
-/** DRFM 重放(上一脉冲波形)经当前脉冲匹配滤波器的峰值功率比 (1=完全匹配) */
 function crossMatch(a, b) {
   const n = Math.max(a.n, b.n), nf = nextPow2(2 * n);
   const ar = new Float64Array(nf), ai = new Float64Array(nf), br = new Float64Array(nf), bi = new Float64Array(nf);
@@ -392,7 +392,6 @@ function rainCoeff(fGHz) {
   const f = clamp(fGHz, 8, 12), i = f <= 10 ? 0 : 1, t = (f - P[i][0]) / (P[i + 1][0] - P[i][0]);
   return { k: Math.exp(Math.log(P[i][1]) + t * (Math.log(P[i + 1][1]) - Math.log(P[i][1]))), alpha: P[i][2] + t * (P[i + 1][2] - P[i][2]) };
 }
-/** ITU-R P.838 幂律双程降雨衰减；雨区限制：水平范围 extentKm、高度 < rainTopKm */
 function rainLossTwoWayDb(Rkm, fGHz, rainMmH, extentKm, h1m, h2m, rainTopKm) {
   if (!(rainMmH > 0)) return 0;
   const top = (rainTopKm != null ? rainTopKm : 10) * 1000;
@@ -412,7 +411,7 @@ function eclipseLossFraction(Rm, tau, trec, pri) {
 function foldDoppler(fd, prf) { let x = fd % prf; if (x > prf / 2) x -= prf; if (x < -prf / 2) x += prf; return x; }
 const horizonKm = (h1, h2) => 4.12 * (Math.sqrt(Math.max(0, h1)) + Math.sqrt(Math.max(0, h2)));
 
-/** 相参脉冲雷达方程(能量形式)：SNR = Pt·τ·N·Gt·Gr·λ²·σ / ((4π)³R⁴·kT0·F·L)  (脉压增益已含于 Pt·τ) */
+/** 相参脉冲雷达方程(能量形式)：SNR = Pt·τ·N·Gt·Gr·λ²·σ / ((4π)³R⁴·kT0·F·L) */
 function radarEquation(p) {
   const lam = wavelength(p.fGHz);
   const num = p.PtW * p.tauS * p.nCoh * p.GtLin * p.GrLin * lam * lam * p.rcs;
@@ -435,7 +434,6 @@ function i0e(z) {
   const t = 3.75 / z;
   return (0.39894228 + t * (0.01328592 + t * (0.00225319 + t * (-0.00157565 + t * (0.00916281 + t * (-0.02057706 + t * (0.02635537 + t * (-0.01647633 + t * 0.00392377)))))))) / Math.sqrt(z);
 }
-/** 非起伏目标固定门限 Pd (平方律，噪声功率=1，信号功率=S)：Marcum Q 数值积分 */
 function pdFixedThreshold(S, T) {
   if (S <= 1e-12) return Math.exp(-T);
   const sq = Math.sqrt(S), xmax = Math.max((sq + 8) ** 2, T + 20);
@@ -481,7 +479,6 @@ function solvePerBurstPfa(N, M, pfaSys) {
   for (let i = 0; i < 80; i++) { const m = (lo + hi) / 2; if (binomTail(N, M, Math.exp(m)) > pfaSys) hi = m; else lo = m; }
   return Math.exp((lo + hi) / 2);
 }
-/** 蒙特卡洛单元检测：测试单元 |√S+n|²  vs  α·(n_ref 个参考单元均值)；噪声功率放大 noiseScale(干扰/杂波) */
 function mcDetect(rng, S, noiseScale, alpha, nRef) {
   const sd = Math.sqrt(noiseScale / 2), re = Math.sqrt(S) + sd * rng.gauss(), im = sd * rng.gauss();
   let ref;
@@ -489,7 +486,6 @@ function mcDetect(rng, S, noiseScale, alpha, nRef) {
   else { ref = 0; for (let i = 0; i < nRef; i++) ref += rng.exp(); ref = ref * noiseScale / nRef; }
   return re * re + im * im > alpha * ref;
 }
-/** 多 PRF 距离解模糊 (中国剩余定理的搜索实现) */
 function resolveRange(apps, tol, rMax) {
   const Ru = f => C / (2 * f);
   if (apps.length === 1) return { R: apps[0].r, ok: true, nCand: 1, single: true };
@@ -504,12 +500,10 @@ function resolveRange(apps, tol, rMax) {
   }
   if (!c.length) return { R: NaN, ok: false, nCand: 0 };
   c.sort((a, b) => a.resid - b.resid);
-  // 多个 CRT 候选时优先最近距离(首个模糊区间)；远处目标由 amb 标记暴露
   const rmin = c[0].resid, near = c.filter(q => q.resid <= rmin + tol * tol * 0.01);
   near.sort((a, b) => a.R - b.R);
   return { R: near[0].R, ok: true, nCand: c.length, amb: c.length > 1 };
 }
-/** DPCA：双子孔径时延相消，动目标响应 4sin²(2π v Δt/λ)，Δt = d_sub/(2Va) */
 function dpcaResponse(vGroundRadial, lam, dSub, Va) {
   const dphi = 4 * Math.PI * vGroundRadial * (dSub / (2 * Va)) / lam;
   return 2 * (1 - Math.cos(dphi));
@@ -540,19 +534,23 @@ const PRF_SETS = {
 };
 function defaultConfig() {
   return {
-    seed: 1, mode: 'RWS', timeScale: 1, fGHz: 10, rangeMaxKm: 160,
+    seed: 1, mode: 'RWS', autoMode: true, timeScale: 1, fGHz: 10, rangeMaxKm: 160,
     array: { diameter: 0.70, grid: 'triangular', spacingLambda: 0.61, trPeakW: 10, failRate: 0, phaseBits: 6, ampBits: 0, rxTaper: 'lowsll', taperN: 2.2, pedestal: 0.05, spoilBeta: 5.0 },
     tx: { waveform: 'lfm', tauUs: 18, bwMHz: 20, window: 'hamming', prfRegime: 'mprf3', customPrf: [15], nCpi: 48, mOfN: 2, dutyMax: 0.35, trecUs: 2 },
     rx: { nfDb: 3.2, lossDb: 3.8, pfa: 1e-9, nRef: 32, stc: true, stcRangeKm: 15 },
     scan: { azCenter: 0, azHalf: 60, elCenter: 0, bars: 4, barSpacingDeg: 0, stepFactor: 0.8 },
     own: { alt: 8000, speed: 250 },
     env: { rainMmH: 0, rainExtentKm: 40, rainTopKm: 10, clutterGammaDb: -15, clutterOn: true },
-    eccm: { adbf: false, agility: false, agLowGHz: 8, agHighGHz: 12, dpca: false, leadingEdge: false, slb: false },
+    eccm: {
+      adbf: false, agility: false, agLowGHz: 8, agHighGHz: 12,
+      dpca: false, leadingEdge: false, slb: false,
+      osCfar: false, dopplerGate: false, mtdNotch: false, burnThrough: false, autoEccm: false
+    },
     track: { revisitS: 1.0 }, acmSub: 'hud'
   };
 }
 const MODE_PRESETS = {
-  RWS: { tracks: false, rxTaper: 'lowsll', tx: { waveform: 'lfm', window: 'hamming', tauUs: 18, bwMHz: 20, prfRegime: 'mprf3', nCpi: 48, mOfN: 2 }, scan: { azHalf: 60, bars: 4, elCenter: 0 } },
+  RWS: { tracks: true, rxTaper: 'lowsll', tx: { waveform: 'lfm', window: 'hamming', tauUs: 18, bwMHz: 20, prfRegime: 'mprf3', nCpi: 48, mOfN: 2 }, scan: { azHalf: 60, bars: 4, elCenter: 0 } },
   TWS: { tracks: true, rxTaper: 'lowsll', tx: { waveform: 'lfm', window: 'hamming', tauUs: 15, bwMHz: 20, prfRegime: 'mprf3', nCpi: 32, mOfN: 2 }, scan: { azHalf: 30, bars: 2, elCenter: 0 } },
   TAS: { tracks: true, rxTaper: 'lowsll', tx: { waveform: 'lfm', window: 'hamming', tauUs: 18, bwMHz: 20, prfRegime: 'mprf3', nCpi: 36, mOfN: 2 }, scan: { azHalf: 60, bars: 2, elCenter: 0 } },
   MTT: { tracks: true, rxTaper: 'lowsll', tx: { waveform: 'lfm', window: 'hamming', tauUs: 12, bwMHz: 50, prfRegime: 'mprf3', nCpi: 48, mOfN: 2 }, scan: { azHalf: 60, bars: 2, elCenter: 0 } },
@@ -608,6 +606,29 @@ const SCENARIOS = {
     name: '强降雨衰减与全 X 波段频点优选', seed: 37, mode: 'RWS',
     config: { fGHz: 12, env: { rainMmH: 25, rainExtentKm: 40, rainTopKm: 10 }, scan: { azCenter: 0, azHalf: 20, bars: 1, elCenter: 0 } },
     targets: [{ name: 'RainTarget', rangeKm: 65, azDeg: 0, altM: 8000, speed: 260, headingDeg: 180, rcs: 5.0, swerling: 1 }]
+  },
+  vgpo_rvgpo: {
+    name: '复合距离-速度拖引 (RVGPO) + 灵巧伴随噪声', seed: 43, mode: 'TWS',
+    config: { scan: { azCenter: 0, azHalf: 25, bars: 2, elCenter: 0 } },
+    targets: [
+      { name: 'EW-Flanker', rangeKm: 58, azDeg: -6, altM: 8200, speed: 310, headingDeg: 178, rcs: 3.5, swerling: 1 },
+      { name: 'Wingman', rangeKm: 64, azDeg: 8, altM: 8400, speed: 300, headingDeg: 182, rcs: 2.8, swerling: 1 }
+    ],
+    jammers: [
+      { type: 'rvgpo', azDeg: -6, elDeg: 0, rangeKm: 58, erpDbW: 62, fGHz: 10, bwMHz: 25, targetId: 'T1', rgpoRate: 180, rgpoMaxKm: 7, vgpoRateHzS: 900 },
+      { type: 'swept', azDeg: 8, elDeg: 0, rangeKm: 64, erpDbW: 66, fGHz: 10, bwMHz: 35, targetId: 'T2' }
+    ]
+  },
+  chaff_barrage: {
+    name: '无源箔条走廊 (Chaff) + 宽带阻塞混合干扰', seed: 53, mode: 'RWS',
+    config: { scan: { azCenter: 0, azHalf: 30, bars: 2, elCenter: 0 } },
+    targets: [
+      { name: 'Penetrator', rangeKm: 52, azDeg: 4, altM: 7800, speed: 270, headingDeg: 180, rcs: 1.5, swerling: 1 }
+    ],
+    jammers: [
+      { type: 'chaff', azDeg: 4, elDeg: 0, rangeKm: 52, erpDbW: 55, fGHz: 10, bwMHz: 20, targetId: 'T1', chaffRcs: 160 },
+      { type: 'barrage', azDeg: -18, elDeg: 0, rangeKm: 95, erpDbW: 72, fGHz: 10, bwMHz: 200 }
+    ]
   }
 };
 function createScenario(key) {
@@ -617,6 +638,7 @@ function createScenario(key) {
   if (sc.config) sim.setConfig(sc.config);
   (sc.targets || []).forEach(t => sim.addTarget(t));
   (sc.jammers || []).forEach(j => sim.addJammer(j));
+  sim.events = [{ t: 0, from: 'INIT', to: sim.cfg.mode, msg: `加载想定「${sc.name}」，初始工作状态 ${sim.cfg.mode}` }];
   return sim;
 }
 
@@ -628,6 +650,9 @@ function deepMerge(t, s) {
   return t;
 }
 
+const NOISE_JAMMER_TYPES = new Set(['spot', 'barrage', 'swept']);
+const DECEPTION_JAMMER_TYPES = new Set(['drfm', 'vgpo', 'rvgpo']);
+
 /* ====================================================== RadarSim */
 class RadarSim {
   constructor(cfg) {
@@ -637,21 +662,59 @@ class RadarSim {
     this.tid = 0; this.trid = 0; this.events = []; this.targetStats = {};
     this.scanIdx = 0; this.frames = 0; this.frameStartT = 0; this.frameTimeS = 0; this.lastDwell = null;
     this.lockId = null; this.lockIds = []; this.rr = 0; this.lastTrackDwell = {}; this.timeBudget = 0; this.slow = false;
+    this.lastModeSwitchT = 0; this.tacticalPhase = 'SEARCH'; this.gmtiSubState = 'GMTI_SEARCH';
     this._cache = {}; this.gm = null;
     this.rebuild();
   }
 
-  setConfig(patch) { deepMerge(this.cfg, patch); this.rebuild(); }
-  applyMode(mode) {
+  setConfig(patch) {
+    deepMerge(this.cfg, patch);
+    this.rebuild();
+    this._pruneUndetectablePlots();
+  }
+  applyMode(mode, reasonMsg) {
     const p = MODE_PRESETS[mode]; if (!p) return;
+    const prev = this.cfg.mode;
     this.cfg.mode = mode;
     this.cfg.array.rxTaper = p.rxTaper;
     deepMerge(this.cfg.tx, p.tx); deepMerge(this.cfg.scan, p.scan);
     this.cfg.scan.barSpacingDeg = 0;
     if (p.eccm) deepMerge(this.cfg.eccm, p.eccm);
     if (mode === 'ACM') deepMerge(this.cfg.scan, ACM_SUBMODES[this.cfg.acmSub] || {});
-    if (mode === 'STT' || mode === 'DTT') { if (!this.lockId) this.autoLockStrongest(mode === 'DTT' ? 2 : 1); }
+    if (mode === 'STT' || mode === 'DTT') {
+      if (!this.lockId) this.autoLockStrongest(mode === 'DTT' ? 2 : 1);
+    }
+    this.lastModeSwitchT = this.time;
+    this._updateTacticalPhase();
+    if (prev !== mode) {
+      this._pushEvent(prev, mode, reasonMsg || `手动切换模式 ${prev} → ${mode}`);
+    }
     this.rebuild();
+  }
+
+  _pushEvent(from, to, msg) {
+    this.events.unshift({ t: this.time, from, to, msg });
+    if (this.events.length > 40) this.events.length = 40;
+  }
+
+  _updateTacticalPhase() {
+    const m = this.cfg.mode;
+    const conf = this.tracks.filter(t => t.confirmed && !t.isFalse);
+    if (m === 'GM' || m === 'SAR') this.tacticalPhase = 'IMAGING';
+    else if (m === 'STT' && this.lockId) this.tacticalPhase = 'LOCK_ENGAGE';
+    else if (m === 'DTT' && this.lockIds.length) this.tacticalPhase = 'DUAL_LOCK';
+    else if (m === 'ACM') this.tacticalPhase = this.lockId ? 'LOCK_ENGAGE' : 'WVR_ACQUIRE';
+    else if (m === 'GMTI') {
+      this.gmtiSubState = conf.some(t => t.ground) ? 'GMTT_TRACK' : 'GMTI_SEARCH';
+      this.tacticalPhase = conf.some(t => t.ground) ? 'GMTT_TRACK' : 'GMTI_SEARCH';
+    } else if (conf.length > 0) {
+      const anyCoasting = conf.some(tr => (this.time - tr.lastHit) > Math.max(1.8, (this.derived ? this.derived.frameS : 1.5) * 1.1));
+      this.tacticalPhase = anyCoasting ? 'COAST_MEMORY' : (m === 'MTT' || m === 'TAS' ? 'MULTI_TRACK' : 'TRACK_SCAN');
+    } else if (this.tracks.length > 0 || this.plots.some(p => !p.isFalse)) {
+      this.tacticalPhase = 'ACQUIRE';
+    } else {
+      this.tacticalPhase = 'SEARCH';
+    }
   }
 
   /* ---- targets / jammers ---- */
@@ -672,7 +735,6 @@ class RadarSim {
     const cur = this.targetState(tg, this.time);
     const hasPos = patch.rangeKm != null || patch.azDeg != null || patch.altM != null;
     if (!hasPos) {
-      // 保持当前时刻的瞬时空间坐标，仅更新运动速度/航向/RCS/模型
       const sp = Object.assign({}, tg.spec, { rangeKm: cur.R / 1000, azDeg: cur.az, altM: cur.alt }, patch);
       tg.spec = sp; tg.name = sp.name; tg.rcs = sp.rcs; tg.swerling = sp.swerling; tg.isGround = !!sp.isGround;
       tg.x0 = cur.px; tg.y0 = cur.py; tg.z0 = cur.alt; tg.t0 = this.time;
@@ -680,17 +742,54 @@ class RadarSim {
     } else {
       this.placeTarget(tg, Object.assign({ rangeKm: cur.R / 1000, azDeg: cur.az, altM: cur.alt }, patch));
     }
+    this._pruneUndetectablePlots();
     return tg;
   }
-  removeTarget(id) { this.targets = this.targets.filter(t => t.id !== id); this.tracks = this.tracks.filter(tr => tr.truth !== id); }
+  removeTarget(id) {
+    this.targets = this.targets.filter(t => t.id !== id);
+    this.tracks = this.tracks.filter(tr => tr.truth !== id);
+    this.plots = this.plots.filter(p => p.truth !== id);
+    if (this.lockId && !this.tracks.some(t => t.id === this.lockId)) this.lockId = null;
+    this.lockIds = this.lockIds.filter(lid => this.tracks.some(t => t.id === lid));
+  }
   addJammer(s) {
     let n = this.jammers.length + 1;
     while (this.jammers.some(j => j.id === 'J' + n)) n++;
-    const j = Object.assign({ id: 'J' + n, type: 'spot', azDeg: -22, elDeg: 0, rangeKm: 100, erpDbW: 40, fGHz: 10, bwMHz: 20, targetId: null, rgpoRate: 150, rgpoMaxKm: 6, pulseRate: 3 }, s);
-    this.jammers.push(j); return j;
+    const j = Object.assign({
+      id: 'J' + n, type: 'spot', azDeg: -22, elDeg: 0, rangeKm: 100, erpDbW: 40, fGHz: 10, bwMHz: 20,
+      targetId: this.targets[0] ? this.targets[0].id : null,
+      rgpoRate: 150, rgpoMaxKm: 6, vgpoRateHzS: 800, vgpoMaxHz: 6000, pulseRate: 3, chaffRcs: 150
+    }, s);
+    this.jammers.push(j);
+    this._pruneUndetectablePlots();
+    return j;
   }
-  updateJammer(id, patch) { const j = this.jammers.find(q => q.id === id); if (j) Object.assign(j, patch); return j; }
-  removeJammer(id) { this.jammers = this.jammers.filter(j => j.id !== id); }
+  updateJammer(id, patch) {
+    const j = this.jammers.find(q => q.id === id);
+    if (j) Object.assign(j, patch);
+    this._pruneUndetectablePlots();
+    return j;
+  }
+  removeJammer(id) {
+    this.jammers = this.jammers.filter(j => j.id !== id);
+    this.plots = this.plots.filter(p => p.truth !== id);
+  }
+
+  _pruneUndetectablePlots() {
+    if (!this.targets || !this.targets.length) return;
+    const undetectable = new Set();
+    for (const tg of this.targets) {
+      const diag = this.analyzeTarget(tg);
+      if (diag.verdict !== 'OK') undetectable.add(tg.id);
+    }
+    if (undetectable.size > 0) {
+      this.plots = this.plots.filter(p => p.isFalse || !undetectable.has(p.truth));
+      this.tracks = this.tracks.filter(tr => tr.isFalse || !undetectable.has(tr.truth));
+      if (this.lockId && !this.tracks.some(t => t.id === this.lockId)) this.lockId = null;
+      this.lockIds = this.lockIds.filter(lid => this.tracks.some(t => t.id === lid));
+    }
+    this._runAutoStateMachine([], this.time, true);
+  }
 
   targetState(tg, t) {
     const dt = t - tg.t0, Va = this.cfg.own.speed, lam = wavelength(this.cfg.fGHz);
@@ -699,11 +798,48 @@ class RadarSim {
     const vrx = tg.vx, vry = tg.vy - Va, vrz = tg.vz;
     const closing = -(px * vrx + py * vry + pz * vrz) / Math.max(R, 1);
     const losx = px / R, losy = py / R, losz = pz / R;
-    const vGround = tg.vx * losx + tg.vy * losy + tg.vz * losz;  // 目标相对地面的视线速度分量(远离为正)
+    const vGround = tg.vx * losx + tg.vy * losy + tg.vz * losz;
     return {
       R, gr, az: Math.atan2(px, py) * RAD, el: Math.atan2(pz, gr) * RAD, closing, fd: 2 * closing / lam, vGround,
       alt: tg.z0 + tg.vz * dt, visible: gr / 1000 <= horizonKm(this.cfg.own.alt, Math.max(0, tg.z0 + tg.vz * dt)), px, py, pz
     };
+  }
+
+  /** 获取单个目标的实时战术探测状态与关联航迹 */
+  getTargetTacticalStatus(tg) {
+    if (!tg) return { status: 'UNDETECTED', isDetected: false, track: null, plotCount: 0 };
+    const d = this.derived || { frameS: 1.5 };
+    const diag = this.analyzeTarget(tg);
+    const recentWin = Math.max(2.5, d.frameS * 1.4);
+    const recentPlots = this.plots.filter(p => !p.isFalse && p.truth === tg.id && (this.time - p.t) <= recentWin);
+    const realTrack = this.tracks.find(tr => tr.truth === tg.id && !tr.isFalse);
+    const falseTrack = this.tracks.find(tr => tr.truth === tg.id && tr.isFalse);
+
+    if (diag.verdict !== 'OK') {
+      if (realTrack && realTrack.confirmed && (this.time - realTrack.lastHit) <= Math.max(3.5, d.frameS * 1.6)) {
+        return { status: 'COASTING', isDetected: false, track: realTrack, plotCount: 0, diag };
+      }
+      return { status: 'UNDETECTED', isDetected: false, track: null, plotCount: 0, diag };
+    }
+
+    if (falseTrack && falseTrack.confirmed && (!realTrack || falseTrack.id === this.lockId)) {
+      return { status: 'DECEIVED', isDetected: true, track: falseTrack, plotCount: recentPlots.length, diag };
+    }
+    if (realTrack) {
+      const age = this.time - realTrack.lastHit;
+      const isCoasting = (realTrack.missDw >= 2) || (age > Math.max(2.0, d.frameS * 1.25));
+      if (realTrack.id === this.lockId || this.lockIds.includes(realTrack.id)) {
+        return { status: isCoasting ? 'COASTING' : 'LOCKED', isDetected: !isCoasting, track: realTrack, plotCount: recentPlots.length, diag };
+      }
+      if (realTrack.confirmed) {
+        return { status: isCoasting ? 'COASTING' : 'TRACKED', isDetected: !isCoasting, track: realTrack, plotCount: recentPlots.length, diag };
+      }
+      return { status: 'ACQUIRING', isDetected: true, track: realTrack, plotCount: recentPlots.length, diag };
+    }
+    if (recentPlots.length > 0) {
+      return { status: 'ACQUIRING', isDetected: true, track: null, plotCount: recentPlots.length, diag };
+    }
+    return { status: 'UNDETECTED', isDetected: false, track: null, plotCount: 0, diag };
   }
 
   /* ---- derived parameters ---- */
@@ -721,9 +857,11 @@ class RadarSim {
     d.tau = tx.tauUs * 1e-6; d.trec = tx.trecUs * 1e-6;
     d.duty = d.tau * Math.max(...d.prfs);
     d.txInhibit = d.duty > tx.dutyMax ? 'duty' : (d.tau >= 0.9 / Math.max(...d.prfs) ? 'pulse>PRI' : null);
+    const btFactor = cfg.eccm.burnThrough ? 4.5 : 1.0;
+    d.nCpiEff = Math.round(tx.nCpi * btFactor);
     d.dwellS = d.prfs.reduce((s, f) => s + tx.nCpi / f, 0) + 2e-4;
     d.healthy = 0; for (let i = 0; i < this.array.N; i++) d.healthy += this.health[i];
-    d.PtW = d.healthy * a.trPeakW;
+    d.PtW = d.healthy * a.trPeakW * (cfg.eccm.burnThrough ? 1.6 : 1.0);
     d.avgPowerW = d.PtW * d.duty;
     // 波形与匹配滤波
     const wkey = [tx.waveform, tx.tauUs, tx.bwMHz, tx.window].join('|');
@@ -733,9 +871,10 @@ class RadarSim {
     }
     d.bwEff = this.wf.B; d.rangeRes = this.mf.rangeRes; d.mfLossDb = this.mf.mismatchLossDb;
     d.ruKm = d.prfs.map(f => C / (2 * f) / 1000);
-    // 虚警控制
+    // 虚警控制 (OS-CFAR 在复杂干扰边缘具备更低的非均匀损耗)
     d.pfaBurst = solvePerBurstPfa(d.nB, d.M, cfg.rx.pfa);
-    d.alpha = cfarAlpha(cfg.rx.nRef, d.pfaBurst);
+    const effNref = cfg.eccm.osCfar ? Math.max(cfg.rx.nRef, 48) : cfg.rx.nRef;
+    d.alpha = cfarAlpha(effNref, d.pfaBurst);
     d.nCells = Math.max(1, cfg.rangeMaxKm * 1000 / Math.max(d.rangeRes, 1)) * tx.nCpi;
     // 阵面切面(宽边波束)：HPBW 用于扫描步进与测角
     const ckey = [akey, hkey, cfg.fGHz, a.rxTaper, a.taperN, a.pedestal, a.spoilBeta, a.phaseBits, a.ampBits].join('|');
@@ -756,6 +895,10 @@ class RadarSim {
     const a = this.cfg.array;
     return { fGHz: f, az, el, taper: rx ? a.rxTaper : this._txTaper(), taperN: a.taperN, pedestal: a.pedestal, spoilBeta: a.spoilBeta, phaseBits: a.phaseBits, ampBits: a.ampBits, health: this.health, nulls };
   }
+  _activeNulls() {
+    if (!this.cfg.eccm.adbf) return [];
+    return this.jammers.filter(j => NOISE_JAMMER_TYPES.has(j.type)).map(j => ({ az: j.azDeg, el: j.elDeg }));
+  }
   _computeCuts() {
     const f = this.cfg.fGHz, arr = this.array, wT = buildWeights(arr, this._wOpts(f, 0, 0, false)), wR = buildWeights(arr, this._wOpts(f, 0, 0, true));
     const n = 721, ca = [cutAz(arr, wT, f, 0, -30, 30, n), cutAz(arr, wR, f, 0, -30, 30, n)], ce = [cutEl(arr, wT, f, 0, -30, 30, n), cutEl(arr, wR, f, 0, -30, 30, n)];
@@ -767,12 +910,10 @@ class RadarSim {
       twoWayAz: { ang: ca[1].ang, db: Array.from(aA.rel) }, twoWayEl: { ang: ce[1].ang, db: Array.from(aE.rel) }
     };
   }
-  /** 当前阵面/波束的实时方向图：方位切面、俯仰切面与可选二维 (u,v) 图 */
   beamPattern(az, el, o) {
     o = o || {};
     const cfg = this.cfg, arr = this.array, f = o.fGHz || cfg.fGHz;
-    const nulls = o.nulls !== undefined ? o.nulls
-      : (cfg.eccm.adbf ? this.jammers.filter(j => j.type !== 'drfm').map(j => ({ az: j.azDeg, el: j.elDeg })) : []);
+    const nulls = o.nulls !== undefined ? o.nulls : this._activeNulls();
     const wT = buildWeights(arr, this._wOpts(f, az, el, false, nulls));
     const wR = buildWeights(arr, this._wOpts(f, az, el, true, nulls));
     const n = o.points || 361, span = o.spanDeg || 40;
@@ -804,10 +945,9 @@ class RadarSim {
     return out;
   }
 
-  /** 阵面激励分布快照：供阵面画布绘制幅度/相位/失效 */
   arrayMap(az, el, f) {
     const arr = this.array;
-    const w = buildWeights(arr, this._wOpts(f || this.cfg.fGHz, az || 0, el || 0, true));
+    const w = buildWeights(arr, this._wOpts(f || this.cfg.fGHz, az || 0, el || 0, true, this._activeNulls()));
     const health = new Uint8Array(arr.N);
     for (let i = 0; i < arr.N; i++) health[i] = this.health ? this.health[i] : 1;
     return { N: arr.N, x: arr.x, y: arr.y, rho: arr.rho, quad: arr.quad, R: arr.R, amp: w.amp, phase: w.phase, health };
@@ -844,7 +984,6 @@ class RadarSim {
     const h = cfg.own.alt, Rg = h / Math.sin(depr), Va = cfg.own.speed, cosPsi = Math.cos(beamAz * DEG) * Math.cos(beamEl * DEG);
     if (Rg > horizonKm(h, 0) * 1000) return null;
     const sinPsi = Math.sqrt(Math.max(0.08, 1 - cosPsi * cosPsi));
-    // 主瓣零点宽度 (~2.4*HPBW) 投射的多普勒展宽 + 平台微动/杂波内运动展宽 (对应常规PD最小可检测速度 MDV ≈ 18 m/s)
     const nullBwRad = 2.4 * d.hpbwDeg * DEG;
     const mdvSpread = 2 * (2 * 18.0 / lam);
     const fcl = 2 * Va * cosPsi / lam;
@@ -855,8 +994,67 @@ class RadarSim {
     return { Rg, fcl, width, sigma0, area: A, footR: elFoot };
   }
 
+  /** 评估单目标遭遇的无源箔条走廊 (Chaff) 杂波与扫频灵巧噪声 CFAR 遮蔽效应 */
+  _evalTargetSpecialJamming(tg, s, fc, wT, wR, gT, gR) {
+    const cfg = this.cfg, eccm = cfg.eccm;
+    let chaffCn = 0, smartMaskLin = 1, activeChaff = null, activeSwept = null;
+    for (const j of this.jammers) {
+      if (j.type === 'chaff') {
+        const matchTg = j.targetId === tg.id || (Math.abs(j.azDeg - s.az) < 6 && Math.abs(j.rangeKm - s.R / 1000) < 8);
+        if (matchTg) {
+          activeChaff = j;
+          const chaffRcs = j.chaffRcs || 150;
+          const cEq = this._link(tg, s, fc, gT, gR, 0, chaffRcs / Math.max(tg.rcs, 1e-4));
+          let cn = unDb(cEq.snrDb);
+          if (eccm.mtdNotch) cn /= unDb(52); // MTD 自适应凹口滤波抑制慢速箔条云 52 dB
+          if (eccm.dpca) cn /= unDb(15);
+          chaffCn += cn;
+          if (!eccm.osCfar && !eccm.mtdNotch) smartMaskLin *= unDb(6.0);
+        }
+      } else if (j.type === 'swept') {
+        const matchTg = j.targetId === tg.id || Math.abs(j.azDeg - s.az) < 12;
+        if (matchTg && !eccm.osCfar && !eccm.adbf && !eccm.agility) {
+          activeSwept = j;
+          smartMaskLin *= unDb(7.5); // 伴随灵巧噪声污染 CA-CFAR 参考窗导致门限额外抬升
+        }
+      }
+    }
+    return { chaffCn, smartMaskLin, activeChaff, activeSwept };
+  }
+
+  /* ---- 认知自适应抗干扰 (Auto-ECCM) ---- */
+  _runAutoEccm() {
+    if (!this.cfg.eccm.autoEccm) return;
+    const e = this.cfg.eccm;
+    let changed = false;
+    const hasNoise = this.jammers.some(j => NOISE_JAMMER_TYPES.has(j.type));
+    const hasNarrowNoise = this.jammers.some(j => j.type === 'spot' || j.type === 'swept');
+    const hasBarrage = this.jammers.some(j => j.type === 'barrage');
+    const hasRgpo = this.jammers.some(j => j.type === 'drfm' || j.type === 'rvgpo');
+    const hasVgpo = this.jammers.some(j => j.type === 'vgpo' || j.type === 'rvgpo');
+    const hasPulse = this.jammers.some(j => j.type === 'pulse');
+    const hasChaff = this.jammers.some(j => j.type === 'chaff');
+    const hasSwept = this.jammers.some(j => j.type === 'swept');
+    const hasGroundClutter = this.cfg.env.clutterOn && (this.cfg.mode === 'GMTI' || this.targets.some(t => t.isGround));
+
+    if (hasNoise && !e.adbf) { e.adbf = true; changed = true; this._pushEvent('ECCM', 'ADBF', '[认知抗干扰] 侦测到有源压制干扰，自动激活 ADBF 方向图零陷'); }
+    if ((hasNarrowNoise || hasRgpo) && !e.agility) { e.agility = true; changed = true; this._pushEvent('ECCM', 'AGIL', '[认知抗干扰] 侦测到窄带/转发干扰，自动激活 8~12GHz 脉间捷变频'); }
+    if (hasBarrage && !e.burnThrough) { e.burnThrough = true; changed = true; this._pushEvent('ECCM', 'BURN', '[认知抗干扰] 侦测到宽带阻塞干扰，自动激活高能量凝视烧穿 (Burn-Through)'); }
+    if (hasRgpo && (!e.leadingEdge || this.cfg.tx.waveform !== 'costas')) {
+      e.leadingEdge = true; this.cfg.tx.waveform = 'costas'; changed = true;
+      this._pushEvent('ECCM', 'COSTAS+LE', '[认知抗干扰] 侦测到 DRFM 距离拖引，自动切换 Costas 跳频码 + 前沿跟踪');
+    }
+    if (hasVgpo && !e.dopplerGate) { e.dopplerGate = true; changed = true; this._pushEvent('ECCM', 'DOP-GATE', '[认知抗干扰] 侦测到速度拖引欺骗 (VGPO)，自动开启多普勒-距离率一致性鉴别'); }
+    if (hasPulse && !e.slb) { e.slb = true; changed = true; this._pushEvent('ECCM', 'SLB', '[认知抗干扰] 侦测到旁瓣异步脉冲干扰，自动开启双通道旁瓣匿影 (SLB)'); }
+    if ((hasChaff || hasSwept) && !e.osCfar) { e.osCfar = true; changed = true; this._pushEvent('ECCM', 'OS-CFAR', '[认知抗干扰] 侦测到伴随灵巧噪声/箔条边缘，自动切换 OS-CFAR 有序统计恒虚警'); }
+    if (hasChaff && !e.mtdNotch) { e.mtdNotch = true; changed = true; this._pushEvent('ECCM', 'MTD-NOTCH', '[认知抗干扰] 侦测到无源箔条云，自动开启自适应 MTD 杂波凹口滤波'); }
+    if (hasGroundClutter && !e.dpca) { e.dpca = true; changed = true; this._pushEvent('ECCM', 'DPCA', '[认知抗干扰] 下视主瓣强地杂波环境，自动开启 DPCA 双子孔径杂波相消'); }
+    if (changed) this.rebuild();
+  }
+
   /* ---- one dwell ---- */
   dwell(beam, kind) {
+    this._runAutoEccm();
     const cfg = this.cfg, d = this.derived, tx = cfg.tx, arr = this.array, t = this.time, rng = this.rng;
     const res = { t, beamAz: beam.az, beamEl: beam.el, kind, cells: [], plots: [], bursts: d.nB, illum: {} };
     this.lastDwell = res;
@@ -865,11 +1063,10 @@ class RadarSim {
     const rLim = this.rangeLimitM();
     const fluc = this.targets.map(tg => tg.swerling === 1 ? rng.exp() : 1);
     const hits = this.targets.map(() => ({ n: 0, apps: [], sig: 0, S: 0 }));
-    const jamHits = {}; // 干扰产生的假目标(ghost)累计
+    const jamHits = {};
     let cacheF = null, wT = null, wR = null, gT = [], gR = [], jInfo = [];
     const agil = cfg.eccm.agility;
-    const nullsBase = [];
-    if (cfg.eccm.adbf) for (const j of this.jammers) if (j.type !== 'drfm') nullsBase.push({ az: j.azDeg, el: j.elDeg });
+    const nullsBase = this._activeNulls();
     for (let b = 0; b < d.nB; b++) {
       const prf = d.prfs[b], pri = 1 / prf;
       const fc = agil ? rng.range(cfg.eccm.agLowGHz, cfg.eccm.agHighGHz) : cfg.fGHz, lam = wavelength(fc);
@@ -882,8 +1079,9 @@ class RadarSim {
       // 噪声类干扰：J/N0 = ERP·λ²·G_r/((4π)²R²·B_j)/(kT0F)
       let JN = 0; const jDetail = [];
       this.jammers.forEach((j, ji) => {
-        if (j.type !== 'spot' && j.type !== 'barrage') return;
-        const bw = j.type === 'barrage' ? 4000e6 : j.bwMHz * 1e6, fj = j.type === 'barrage' ? 10 : j.fGHz;
+        if (!NOISE_JAMMER_TYPES.has(j.type)) return;
+        const bw = j.type === 'barrage' ? 4000e6 : (j.type === 'swept' ? j.bwMHz * 3e6 : j.bwMHz * 1e6);
+        const fj = j.type === 'barrage' ? 10 : j.fGHz;
         const overlap = Math.abs(fc - fj) <= (bw / 1e9) / 2 + this.wf.B / 2e9 || j.type === 'barrage';
         if (!overlap) return;
         const R = j.rangeKm * 1000, atm = unDb(-0.5 * gasLossTwoWayDb(j.rangeKm, fc, cfg.own.alt, cfg.own.alt));
@@ -907,30 +1105,44 @@ class RadarSim {
             const c = this._link(tg, s, fc, gT[i], gR[i], 0, ci.area * ci.sigma0 / tg.rcs);
             CN = unDb(c.snrDb);
             if (cfg.eccm.dpca) { const eps = Math.max(1e-4, dpcaResponse(s.vGround, lam, arr.diameter / 2, cfg.own.speed)); CN /= unDb(38); S *= eps; clutterNote = 'DPCA'; }
+            else if (cfg.eccm.mtdNotch) { CN /= unDb(18); clutterNote = 'MTD'; }
             else clutterNote = 'clutter';
           }
         }
-        const ns = 1 + JN + CN;
-        const hit = S / ns > 0.003 && mcDetect(rng, S, ns, d.alpha, cfg.rx.nRef);
+        const spJam = this._evalTargetSpecialJamming(tg, s, fc, wT, wR, gT[i], gR[i]);
+        CN += spJam.chaffCn;
+        const ns = (1 + JN + CN) * spJam.smartMaskLin;
+        const effNref = cfg.eccm.osCfar ? Math.max(cfg.rx.nRef, 48) : cfg.rx.nRef;
+        const hit = S / ns > 0.003 && mcDetect(rng, S, ns, d.alpha, effNref);
         const ru = C / (2 * prf), sig = Math.max(d.rangeRes / Math.sqrt(2 * Math.max(S / ns, 1e-3)), d.rangeRes / 60);
         res.cells.push({ id: tg.id, burst: b, R: s.R, rApp: s.R % ru, fdApp: foldDoppler(s.fd, prf), snrDb: dB(S + 1e-30), jnDb: dB(JN + 1e-30), cnDb: dB(CN + 1e-30), hit, isFalse: false, eclipse: eclF, note: clutterNote });
         if (hit) { const h = hits[i]; h.n++; h.apps.push({ prf, r: Math.max(0, (s.R % ru) + sig * rng.gauss()), sig }); h.S += S / ns; }
       });
-      // DRFM 假目标 (RGPO + 多假目标)
-      this.jammers.forEach((j, ji) => {
-        if (j.type !== 'drfm') return;
+      // DRFM 欺骗假目标 (RGPO / VGPO / RVGPO)
+      this.jammers.forEach((j) => {
+        if (!DECEPTION_JAMMER_TYPES.has(j.type)) return;
         const ti = this.targets.findIndex(tg => tg.id === j.targetId); if (ti < 0) return;
         const s = states[ti], tg = this.targets[ti]; if (!s.visible || s.R > rLim) return;
-        const rho = (tx.waveform === 'costas' ? d.drfmRho.hop : 1) * (agil ? Math.min(1, (this.wf.B / 1e9) / (cfg.eccm.agHighGHz - cfg.eccm.agLowGHz)) : 1);
+        let rho = (tx.waveform === 'costas' ? d.drfmRho.hop : 1) * (agil ? Math.min(1, (this.wf.B / 1e9) / (cfg.eccm.agHighGHz - cfg.eccm.agLowGHz)) : 1);
+        if ((j.type === 'vgpo' || j.type === 'rvgpo') && cfg.eccm.dopplerGate) {
+          rho /= unDb(18); // 多普勒-距离率一致性鉴别大幅抑制速度欺骗回波
+        }
         const atm1 = unDb(-0.5 * gasLossTwoWayDb(s.R / 1000, fc, cfg.own.alt, s.alt));
-        const Sf0 = unDb(j.erpDbW) * gR[ti] * lam * lam / (Math.pow(4 * Math.PI, 2) * s.R * s.R) * d.tau * tx.nCpi * rho * atm1 / (KB * T0 * unDb(cfg.rx.nfDb) * unDb(cfg.rx.lossDb)) / unDb(d.mfLossDb) * (1 - eclipseLossFraction(s.R, d.tau, d.trec, pri));
-        const per = j.rgpoMaxKm * 1000 / j.rgpoRate + 4, ph = t % per;
-        const off1 = Math.min(j.rgpoMaxKm * 1000, j.rgpoRate * ph), offs = [off1, 4500, 9000];
+        const Sf0 = unDb(j.erpDbW) * gR[ti] * lam * lam / (Math.pow(4 * Math.PI, 2) * s.R * s.R) * d.tau * d.nCpiEff * rho * atm1 / (KB * T0 * unDb(cfg.rx.nfDb) * unDb(cfg.rx.lossDb)) / unDb(d.mfLossDb) * (1 - eclipseLossFraction(s.R, d.tau, d.trec, pri));
+        const per = (j.rgpoMaxKm || 6) * 1000 / (j.rgpoRate || 150) + 4, ph = t % per;
+        const off1 = j.type === 'vgpo' ? 180 : Math.min((j.rgpoMaxKm || 6) * 1000, (j.rgpoRate || 150) * ph);
+        const fdPull = (j.type === 'vgpo' || j.type === 'rvgpo') ? Math.min(j.vgpoMaxHz || 6000, (j.vgpoRateHzS || 800) * ph) : 0;
+        const vPull = fdPull * lam / 2;
+        const offs = j.type === 'vgpo' ? [off1] : [off1, 4500, 9000];
         offs.forEach((off, gi) => {
           const S = Sf0 * (gi === 0 ? 1 : 0.5), Rg = s.R + off, ru = C / (2 * prf);
           const hit = mcDetect(rng, S, 1 + JN, d.alpha, cfg.rx.nRef);
-          res.cells.push({ id: tg.id + '~G' + gi, burst: b, R: Rg, rApp: Rg % ru, fdApp: foldDoppler(s.fd, prf), snrDb: dB(S + 1e-30), hit, isFalse: true, truth: tg.id, eclipse: 0 });
-          if (hit) { const key = tg.id + '~G' + gi; const h = jamHits[key] || (jamHits[key] = { n: 0, apps: [], S: 0, R: Rg, s, tg }); h.n++; h.apps.push({ prf, r: Rg % ru, sig: d.rangeRes / 4 }); h.S += S; }
+          res.cells.push({ id: tg.id + '~G' + gi, burst: b, R: Rg, rApp: Rg % ru, fdApp: foldDoppler(s.fd + fdPull, prf), snrDb: dB(S + 1e-30), hit, isFalse: true, truth: tg.id, eclipse: 0, jamType: j.type });
+          if (hit) {
+            const key = tg.id + '~G' + gi;
+            const h = jamHits[key] || (jamHits[key] = { n: 0, apps: [], S: 0, R: Rg, s, tg, vPull, jamType: j.type });
+            h.n++; h.apps.push({ prf, r: Rg % ru, sig: d.rangeRes / 4 }); h.S += S;
+          }
         });
       });
       // 旁瓣脉冲干扰：SLB 用保护通道(全向 5dBi)比较
@@ -938,7 +1150,7 @@ class RadarSim {
         if (j.type !== 'pulse' || b !== 0) return;
         const R = j.rangeKm * 1000, gj = jInfo[ji].gR, gGuard = unDb(5);
         if (cfg.eccm.slb && gj < gGuard) return;
-        const Sj = unDb(j.erpDbW) * lam * lam * gj / (Math.pow(4 * Math.PI, 2) * R * R) * d.tau * tx.nCpi / (KB * T0 * unDb(cfg.rx.nfDb) * unDb(cfg.rx.lossDb));
+        const Sj = unDb(j.erpDbW) * lam * lam * gj / (Math.pow(4 * Math.PI, 2) * R * R) * d.tau * d.nCpiEff / (KB * T0 * unDb(cfg.rx.nfDb) * unDb(cfg.rx.lossDb));
         const k = rng.poisson(j.pulseRate);
         for (let q = 0; q < k; q++) if (mcDetect(rng, Sj, 1, d.alpha, cfg.rx.nRef)) {
           const rr = rng.range(5000, rLim); res.plots.push({ R: rr, az: beam.az + rng.gauss() * d.hpbwDeg * 0.3, el: beam.el, snrDb: dB(Sj), isFalse: true, truth: j.id, kind: 'pulse-jam' });
@@ -949,10 +1161,14 @@ class RadarSim {
     this.targets.forEach((tg, i) => {
       const h = hits[i], s = states[i];
       const ts = this.targetStats[tg.id] || (this.targetStats[tg.id] = { dwells: 0, illum: 0, det: 0, lastDet: -1, lastSnr: -99 });
+      ts.dwells++;
       if (res.illum[tg.id] != null && res.illum[tg.id] > -6) ts.illum++;
       if (h.n >= d.M) { ts.det++; ts.lastDet = t; this._emitPlot(res, tg.id, false, h, s, beam, tg.id, tg.isGround); ts.lastSnr = dB(h.S / h.n); }
     });
-    for (const key in jamHits) { const h = jamHits[key]; if (h.n >= d.M) this._emitPlot(res, key, true, h, h.s, beam, h.tg.id, false, h.R); }
+    for (const key in jamHits) {
+      const h = jamHits[key];
+      if (h.n >= d.M) this._emitPlot(res, key, true, h, h.s, beam, h.tg.id, false, h.R, h.vPull, h.jamType);
+    }
     // 虚警：单元数 × Pfa
     const nFa = rng.poisson(d.nCells * cfg.rx.pfa);
     for (let q = 0; q < nFa; q++) res.plots.push({ R: rng.range(5000, rLim), az: beam.az + rng.gauss() * d.hpbwDeg * 0.3, el: beam.el, snrDb: dB(d.alpha * 1.2), isFalse: true, truth: 'FA', kind: 'false-alarm' });
@@ -962,37 +1178,50 @@ class RadarSim {
     this._processPlots(res.plots, t, kind, beam);
     return res;
   }
-  _emitPlot(res, id, isFalse, h, s, beam, truth, ground, Roverride) {
+  _emitPlot(res, id, isFalse, h, s, beam, truth, ground, Roverride, vPull, jamType) {
     const d = this.derived, rng = this.rng, apps = h.apps;
     const tol = 6 * Math.max(...apps.map(a => a.sig)) + d.rangeRes;
     let rr = resolveRange(apps, tol, this.cfg.rangeMaxKm * 1000 * 1.5), R, amb = false;
-    if (rr.ok) { R = rr.R; amb = rr.single ? (C / (2 * apps[0].prf)) < this.cfg.rangeMaxKm * 1000 : !!rr.amb; } else { R = apps[0].r; amb = true; }
+    if (rr.ok) {
+      R = rr.single && Roverride != null ? Roverride : rr.R;
+      amb = rr.single ? (C / (2 * apps[0].prf)) < this.cfg.rangeMaxKm * 1000 : !!rr.amb;
+    } else {
+      R = Roverride != null ? Roverride : apps[0].r;
+      amb = true;
+    }
     const snr = h.S / h.n, sa = Math.hypot(s.az - beam.az, s.el - beam.el), inBeam = sa < 0.6 * d.hpbwRxDeg;
     const sigTh = d.hpbwRxDeg / (1.6 * Math.sqrt(2 * Math.max(snr, 1)));
     const az = (inBeam ? s.az : beam.az) + sigTh * rng.gauss(), el = (inBeam ? s.el : beam.el) + sigTh * rng.gauss();
-    res.plots.push({ R, az, el, snrDb: dB(snr), isFalse, truth, kind: isFalse ? 'drfm' : 'target', amb, resolved: rr.ok && !rr.single, sidelobe: !inBeam, ground, id });
+    res.plots.push({
+      R, az, el, snrDb: dB(snr), isFalse, truth,
+      kind: isFalse ? (jamType || 'drfm') : 'target',
+      amb, resolved: rr.ok && !rr.single, sidelobe: !inBeam, ground, id,
+      vPull: vPull || 0, closing: (s ? s.closing : 0) + (vPull || 0)
+    });
   }
   _link(tg, s, fc, gT, gR, eclF, rcsOverride) {
     const cfg = this.cfg, d = this.derived, rx = cfg.rx;
     const Rkm = s.R / 1000;
     return radarEquation({
-      fGHz: fc, PtW: d.PtW, tauS: d.tau, nCoh: cfg.tx.nCpi, GtLin: gT, GrLin: gR, rcs: tg.rcs * rcsOverride, Rm: s.R, nfDb: rx.nfDb, lossDb: rx.lossDb + d.mfLossDb,
+      fGHz: fc, PtW: d.PtW, tauS: d.tau, nCoh: d.nCpiEff || cfg.tx.nCpi, GtLin: gT, GrLin: gR, rcs: tg.rcs * rcsOverride, Rm: s.R, nfDb: rx.nfDb, lossDb: rx.lossDb + d.mfLossDb,
       atmDb: gasLossTwoWayDb(Rkm, fc, cfg.own.alt, s.alt),
       rainDb: rainLossTwoWayDb(Rkm, fc, cfg.env.rainMmH, cfg.env.rainExtentKm, cfg.own.alt, s.alt, cfg.env.rainTopKm),
       stcDb: rx.stc ? stcLossDb(Rkm, rx.stcRangeKm, 2.5) : 0, eclipseDb: eclF > 0 ? -dB(Math.max(1e-6, 1 - eclF)) : 0
     });
   }
 
-  /* ---- tracker (alpha-beta, 笛卡尔) ---- */
+  /* ---- tracker (alpha-beta, 笛卡尔) + 状态自动流转 ---- */
   _processPlots(plots, t, kind, beam) {
-    const d = this.derived, used = new Set(), le = this.cfg.eccm.leadingEdge;
-    if (!d.modeInfo.tracks) return;
+    const d = this.derived, used = new Set(), le = this.cfg.eccm.leadingEdge, dg = this.cfg.eccm.dopplerGate;
+    if (!d.modeInfo.tracks && !this.cfg.autoMode) return;
     for (const tr of this.tracks) {
       const dt = t - tr.t, pred = [tr.x + tr.vx * dt, tr.y + tr.vy * dt, tr.z + tr.vz * dt];
       const sp = Math.hypot(tr.vx, tr.vy, tr.vz), gate = this._gate(tr, dt, sp);
       let best = null, bs = -1e18;
       for (const p of plots) {
         if (used.has(p)) continue;
+        // 若开启多普勒-距离率一致性鉴别，剔除存在显著速度欺骗偏移 (vPull) 的假目标点迹
+        if (dg && p.isFalse && Math.abs(p.vPull || 0) > 25) continue;
         const dd = Math.hypot(p.cart[0] - pred[0], p.cart[1] - pred[1], p.cart[2] - pred[2]);
         if (dd < gate) { const sc = le ? -p.R : p.snrDb; if (sc > bs) { bs = sc; best = p; } }
       }
@@ -1001,62 +1230,280 @@ class RadarSim {
         const z = best.cart, r = [z[0] - pred[0], z[1] - pred[1], z[2] - pred[2]];
         const a = tr.hits < 2 ? 0.7 : 0.45, b = 0.08, ddt = Math.max(dt, 0.05);
         tr.x = pred[0] + a * r[0]; tr.y = pred[1] + a * r[1]; tr.z = pred[2] + a * r[2];
-        if (tr.hits >= 1) { tr.vx += b * r[0] / ddt; tr.vy += b * r[1] / ddt; tr.vz += b * r[2] / ddt; }
-        tr.t = t; tr.lastHit = t; tr.hits++; tr.missDw = 0; tr.truth = best.truth; tr.isFalse = best.isFalse; tr.snrDb = best.snrDb;
-        if (tr.hits >= 3) tr.confirmed = true;
-      } else if (kind === 'track' && tr.id === this.lastTrackedId) tr.missDw = (tr.missDw || 0) + 1;
+        if (tr.hits >= 1) {
+          tr.vx += b * r[0] / ddt; tr.vy += b * r[1] / ddt; tr.vz += b * r[2] / ddt;
+          // VGPO 速度波门拖引效应：未开启 dopplerGate 时，假多普勒速度偏移拉偏滤波器速度矢量
+          if (best.isFalse && best.vPull && !dg) {
+            const R = Math.max(1, Math.hypot(tr.x, tr.y, tr.z));
+            tr.vx += (tr.x / R) * best.vPull * 0.35;
+            tr.vy += (tr.y / R) * best.vPull * 0.35;
+          }
+        }
+        const wasConfirmed = tr.confirmed;
+        tr.t = t; tr.lastHit = t; tr.hits++; tr.missDw = 0; tr.truth = best.truth; tr.isFalse = best.isFalse; tr.snrDb = best.snrDb; tr.ground = !!best.ground;
+        if (tr.hits >= 3) {
+          tr.confirmed = true;
+          if (!wasConfirmed) {
+            this._pushEvent('TENTATIVE', 'CONFIRMED', `航迹 ${tr.id} 连续命中 ${tr.hits} 次，确认稳定跟踪 (${tr.truth})`);
+          }
+        }
+      } else {
+        const predAz = Math.atan2(pred[0], pred[1]) * RAD;
+        const predEl = Math.atan2(pred[2], Math.hypot(pred[0], pred[1])) * RAD;
+        const inCurrentBeam = beam && Math.hypot(predAz - beam.az, predEl - beam.el) < 0.75 * d.hpbwRxDeg;
+        if ((kind === 'track' && tr.id === this.lastTrackedId) || inCurrentBeam) {
+          tr.missDw = (tr.missDw || 0) + 1;
+        }
+      }
     }
     for (const p of plots) {
       if (used.has(p) || p.kind === 'false-alarm' || p.kind === 'pulse-jam' || p.sidelobe) continue;
+      if (dg && p.isFalse && Math.abs(p.vPull || 0) > 25) continue;
       let near = false;
       for (const tr of this.tracks) { const dt = t - tr.t; if (Math.hypot(p.cart[0] - (tr.x + tr.vx * dt), p.cart[1] - (tr.y + tr.vy * dt), p.cart[2] - (tr.z + tr.vz * dt)) < 6000) { near = true; break; } }
-      if (!near) this.tracks.push({ id: 'TK' + (++this.trid), x: p.cart[0], y: p.cart[1], z: p.cart[2], vx: 0, vy: 0, vz: 0, t, lastHit: t, hits: 1, confirmed: false, truth: p.truth, isFalse: p.isFalse, snrDb: p.snrDb, missDw: 0, born: t });
+      if (!near) {
+        const ntk = { id: 'TK' + (++this.trid), x: p.cart[0], y: p.cart[1], z: p.cart[2], vx: 0, vy: 0, vz: 0, t, lastHit: t, hits: 1, confirmed: false, truth: p.truth, isFalse: p.isFalse, snrDb: p.snrDb, missDw: 0, born: t, ground: !!p.ground };
+        this.tracks.push(ntk);
+      }
     }
     this.tracks = this.tracks.filter(tr => {
       const lost = t - tr.lastHit > (tr.confirmed ? d.trackLossS : 1.5 * d.frameS + 2) || (tr.id === this.lockId && (tr.missDw || 0) > 40);
-      if (lost && tr.id === this.lockId) { this.events.push({ t, msg: `STT 失锁 ${tr.id}` }); this.lockId = null; }
+      if (lost) {
+        if (tr.id === this.lockId) {
+          this._pushEvent('STT', 'LOST', `锁定目标 ${tr.id} (${tr.truth}) 信号丢失超时，解除锁定`);
+          this.lockId = null;
+        } else if (tr.confirmed) {
+          this._pushEvent('TRACK', 'LOST', `确认航迹 ${tr.id} (${tr.truth}) 记忆外推超时销批`);
+        }
+      }
       return !lost;
     });
+    this.lockIds = this.lockIds.filter(lid => this.tracks.some(tr => tr.id === lid));
+    if (!this.lockId && this.lockIds.length) this.lockId = this.lockIds[0];
+
+    // 执行模式与战术阶段自动状态机切换
+    this._runAutoStateMachine(plots, t);
+  }
+
+  _runAutoStateMachine(plots, t, forceImmediate) {
+    // 1. ACM 模式下捕获任意目标立即自动切入 STT 锁定
     if (this.cfg.mode === 'ACM' && !this.lockId) {
-      const first = this.tracks.find(tr => tr.confirmed) || null;
+      const first = this.tracks.find(tr => tr.confirmed && !tr.isFalse) || this.tracks.find(tr => !tr.isFalse) || null;
       if (first || plots.some(p => !p.isFalse && p.kind === 'target')) {
         const tr = first || this.tracks[this.tracks.length - 1];
-        if (tr) { tr.confirmed = true; this.lockId = tr.id; this.cfg.mode = 'STT'; this.events.push({ t, msg: `ACM 自动截获 → STT 锁定 ${tr.id}` }); this.rebuild(); }
+        if (tr) {
+          tr.confirmed = true;
+          this.lockId = tr.id;
+          this.lockIds = [tr.id];
+          this.cfg.mode = 'STT';
+          this.lastModeSwitchT = t;
+          this._pushEvent('ACM', 'STT', `ACM 近距宽波束捕获目标 → 自动转入 STT 单脉冲锁定 ${tr.id}`);
+          this.rebuild();
+          this._updateTacticalPhase();
+          return;
+        }
+      }
+    }
+
+    this._updateTacticalPhase();
+    if (!this.cfg.autoMode) return;
+    if (!forceImmediate && (t - this.lastModeSwitchT < 1.6)) return;
+
+    const m = this.cfg.mode;
+    if (m === 'GM' || m === 'SAR' || m === 'GMTI') return;
+
+    const conf = this.tracks.filter(tr => tr.confirmed && !tr.isFalse && !tr.ground);
+    const allTracks = this.tracks.filter(tr => !tr.ground);
+    // 计算各确认航迹当前斜距
+    const confWithRange = conf.map(tr => {
+      const dt = t - tr.t;
+      const R = Math.hypot(tr.x + tr.vx * dt, tr.y + tr.vy * dt, tr.z + tr.vz * dt);
+      return { tr, R };
+    }).sort((a, b) => a.R - b.R);
+    const closestKm = confWithRange.length ? confWithRange[0].R / 1000 : Infinity;
+
+    // (A) RWS 搜索态下：一旦确认航迹建立，自动切入 TWS (单目标) 或 TAS (多目标/大扇区)
+    if (m === 'RWS' && conf.length >= 1) {
+      const nextM = conf.length >= 2 ? 'TAS' : 'TWS';
+      this._autoSwitchMode(nextM, `[自动切换] 搜索发现确认航迹 (${conf.map(q => q.id).join(',')})，${m} → ${nextM}`);
+      return;
+    }
+
+    // (B) TWS 边扫边跟态下：
+    if (m === 'TWS') {
+      if (conf.length === 0 && allTracks.length === 0 && (t - this.lastModeSwitchT > Math.max(3.5, this.derived.frameS * 1.8))) {
+        this._autoSwitchMode('RWS', '[自动切换] TWS 航迹全部丢失，自动退回 RWS 广域搜索');
+        return;
+      }
+      if (conf.length === 1 && closestKm < 45) {
+        this.lockTrack(confWithRange[0].tr.id);
+        this._autoSwitchMode('STT', `[自动切换] 威胁目标 ${confWithRange[0].tr.id} 进入 ${(closestKm).toFixed(1)}km 火控区，TWS → STT 精密锁定`);
+        return;
+      }
+      if (conf.length >= 3 && closestKm < 85) {
+        this._autoSwitchMode('TAS', `[自动切换] 多批次目标 (${conf.length}批) 同时逼近，TWS → TAS 敏捷波束跟踪加搜索`);
+        return;
+      }
+      if (conf.length === 2 && closestKm < 60) {
+        this.autoLockStrongest(2);
+        this._autoSwitchMode('DTT', `[自动切换] 双目标进入中距火控包线 (${closestKm.toFixed(1)}km)，TWS → DTT 双目标精确跟踪`);
+        return;
+      }
+    }
+
+    // (C) TAS 跟踪加搜索态下：
+    if (m === 'TAS') {
+      if (conf.length === 0 && allTracks.length === 0 && (t - this.lastModeSwitchT > Math.max(3.5, this.derived.frameS * 1.8))) {
+        this._autoSwitchMode('RWS', '[自动切换] TAS 跟踪目标丢失，自动退回 RWS 广域搜索');
+        return;
+      }
+      if (conf.length >= 2 && closestKm < 55) {
+        if (conf.length === 2) {
+          this.autoLockStrongest(2);
+          this._autoSwitchMode('DTT', `[自动切换] 双目标逼近至 ${closestKm.toFixed(1)}km，TAS → DTT 双目标精确跟踪`);
+        } else {
+          this._autoSwitchMode('MTT', `[自动切换] 多批次高威胁目标 (${conf.length}批, 最近 ${closestKm.toFixed(1)}km)，TAS → MTT 多目标精确跟踪`);
+        }
+        return;
+      }
+      if (conf.length === 1 && closestKm < 42) {
+        this.lockTrack(confWithRange[0].tr.id);
+        this._autoSwitchMode('STT', `[自动切换] 单目标 ${confWithRange[0].tr.id} 逼近至 ${closestKm.toFixed(1)}km，TAS → STT 连续火控锁定`);
+        return;
+      }
+    }
+
+    // (D) MTT / DTT 精确跟踪态下：
+    if (m === 'MTT' || m === 'DTT') {
+      if (conf.length === 0) {
+        this._autoSwitchMode('RWS', `[自动切换] ${m} 确认航迹全部丢失，自动退回 RWS 广域搜索`);
+        return;
+      }
+      if (closestKm < 20) {
+        this.lockTrack(confWithRange[0].tr.id);
+        this._autoSwitchMode('STT', `[自动切换] 首要威胁 ${confWithRange[0].tr.id} 进入 ${closestKm.toFixed(1)}km 近距决断区，${m} → STT 锁定`);
+        return;
+      }
+    }
+
+    // (E) STT 单目标锁定态下：若失锁 (lockId 为空)，自动降级回 TAS / TWS / RWS / ACM
+    if (m === 'STT' && !this.lockId) {
+      if (conf.length >= 2) {
+        this._autoSwitchMode('TAS', '[自动切换] STT 目标失锁，自动降级至 TAS 维持其余目标跟踪与重捕');
+      } else if (conf.length === 1) {
+        this.lockTrack(confWithRange[0].tr.id);
+        this._pushEvent('STT', 'STT', `[自动重锁] 自动切换锁定剩余确认航迹 ${confWithRange[0].tr.id}`);
+      } else {
+        const anyNear = this.targets.some(tg => this.targetState(tg, t).R < 18000);
+        const fallback = anyNear ? 'ACM' : 'RWS';
+        this._autoSwitchMode(fallback, `[自动切换] STT 失锁且无确认航迹，自动退回 ${fallback} 重新搜索捕获`);
       }
     }
   }
+
+  _autoSwitchMode(newMode, msg) {
+    const prev = this.cfg.mode;
+    if (prev === newMode) return;
+    const p = MODE_PRESETS[newMode]; if (!p) return;
+    this.cfg.mode = newMode;
+    this.cfg.array.rxTaper = p.rxTaper;
+    // 保留用户在自定义想定中的核心脉冲能量配置或平滑合入模式预设
+    this.cfg.tx.prfRegime = p.tx.prfRegime;
+    if (newMode === 'RWS') {
+      this.cfg.scan.azHalf = Math.max(this.cfg.scan.azHalf, 45);
+      this.cfg.scan.bars = Math.max(this.cfg.scan.bars, 2);
+    } else if (newMode === 'ACM') {
+      deepMerge(this.cfg.scan, ACM_SUBMODES[this.cfg.acmSub] || { azHalf: 10, bars: 4 });
+    }
+    this.lastModeSwitchT = this.time;
+    this._pushEvent(prev, newMode, msg);
+    this.rebuild();
+    this._updateTacticalPhase();
+  }
+
   _gate(tr, dt, sp) {
     const d = this.derived, R = Math.hypot(tr.x, tr.y, tr.z), sR = d.rangeRes, sA = R * d.hpbwRxDeg * DEG * 0.5;
     return 4 * Math.hypot(sR, sA) + 0.1 * sp * Math.max(dt, 0) + 500;
   }
   autoLockStrongest(n) {
-    const c = this.tracks.filter(t => t.confirmed).sort((a, b) => b.snrDb - a.snrDb);
-    this.lockIds = c.slice(0, n).map(t => t.id); this.lockId = this.lockIds[0] || null;
+    let c = this.tracks.filter(t => t.confirmed).sort((a, b) => b.snrDb - a.snrDb);
+    if (!c.length) c = this.tracks.slice().sort((a, b) => b.snrDb - a.snrDb);
+    // 若当前只有点迹尚未满3次建批，支持从最新真实目标点迹直接紧急建批锁定
+    if (!c.length) {
+      const recentPlot = this.plots.filter(p => !p.isFalse && p.kind === 'target').sort((a, b) => b.snrDb - a.snrDb)[0];
+      if (recentPlot) {
+        const ntk = {
+          id: 'TK' + (++this.trid), x: recentPlot.cart[0], y: recentPlot.cart[1], z: recentPlot.cart[2],
+          vx: 0, vy: 0, vz: 0, t: this.time, lastHit: this.time, hits: 3, confirmed: true,
+          truth: recentPlot.truth, isFalse: false, snrDb: recentPlot.snrDb, missDw: 0, born: this.time, ground: !!recentPlot.ground
+        };
+        this.tracks.push(ntk);
+        c = [ntk];
+      }
+    }
+    this.lockIds = c.slice(0, n).map(t => t.id);
+    this.lockId = this.lockIds[0] || null;
+    this._updateTacticalPhase();
   }
-  lockTrack(id) { this.lockId = id; if (!this.lockIds.includes(id)) this.lockIds.unshift(id); this.lockIds = this.lockIds.slice(0, 2); }
-  breakLock() { this.lockId = null; this.lockIds = []; }
+  lockTrack(id) {
+    this.lockId = id;
+    if (!this.lockIds.includes(id)) this.lockIds.unshift(id);
+    this.lockIds = this.lockIds.slice(0, 2);
+    this._updateTacticalPhase();
+  }
+  breakLock() {
+    const prevLock = this.lockId;
+    this.lockId = null; this.lockIds = [];
+    if (this.cfg.mode === 'STT' || this.cfg.mode === 'DTT') {
+      const nextM = this.tracks.filter(t => t.confirmed).length > 1 ? 'TAS' : 'TWS';
+      this.cfg.mode = nextM;
+      this._pushEvent('STT', nextM, `手动解除锁定 (${prevLock || ''})，退回 ${nextM} 搜索跟踪`);
+      this.rebuild();
+    }
+    this._updateTacticalPhase();
+  }
 
   /* ---- scheduler ---- */
   _trackBeam(tr) {
     const dt = this.time - tr.t, x = tr.x + tr.vx * dt, y = tr.y + tr.vy * dt, z = tr.z + tr.vz * dt;
-    // 跟踪点为"相对载机的笛卡尔"，转成波束指向
     return { az: Math.atan2(x, y) * RAD, el: Math.atan2(z, Math.hypot(x, y)) * RAD };
   }
   nextBeam() {
     const m = this.cfg.mode, conf = this.tracks.filter(t => t.confirmed);
     const lock = this.tracks.find(t => t.id === this.lockId);
-    if (m === 'STT' && lock) { this.lastTrackedId = lock.id; return Object.assign(this._trackBeam(lock), { kind: 'track' }); }
+    if (m === 'STT' && lock) {
+      // AESA 敏捷波束：在 STT 锁定的同时，若存在其余已确认航迹且超过重访周期，穿插一次微秒级背景维持驻留
+      if (conf.length > 1) {
+        for (const tr of conf) {
+          if (tr.id !== lock.id && (this.time - (this.lastTrackDwell[tr.id] || -1e9)) > Math.max(1.2, this.cfg.track.revisitS * 1.5)) {
+            this.lastTrackDwell[tr.id] = this.time;
+            this.lastTrackedId = tr.id;
+            return Object.assign(this._trackBeam(tr), { kind: 'track' });
+          }
+        }
+      }
+      this.lastTrackedId = lock.id;
+      return Object.assign(this._trackBeam(lock), { kind: 'track' });
+    }
     if (m === 'DTT') {
       const ts = this.lockIds.map(id => this.tracks.find(t => t.id === id)).filter(Boolean);
       if (ts.length) { this.rr = (this.rr + 1) % ts.length; this.lastTrackedId = ts[this.rr].id; return Object.assign(this._trackBeam(ts[this.rr]), { kind: 'track' }); }
     }
-    if (m === 'MTT' && conf.length) { const ts = conf.slice(0, 8); this.rr = (this.rr + 1) % ts.length; this.lastTrackedId = ts[this.rr].id; return Object.assign(this._trackBeam(ts[this.rr]), { kind: 'track' }); }
-    if (m === 'TAS' && conf.length) {
+    if (m === 'MTT' && conf.length) {
+      // 每轮询完所有确认航迹后穿插 1 个背景扫描波束，保持新目标发现能力
+      const ts = conf.slice(0, 8);
+      this.rr = (this.rr + 1) % (ts.length + 1);
+      if (this.rr < ts.length) {
+        this.lastTrackedId = ts[this.rr].id;
+        return Object.assign(this._trackBeam(ts[this.rr]), { kind: 'track' });
+      }
+    }
+    if ((m === 'TAS' || m === 'GMTI') && conf.length) {
       let pick = null, worst = 0;
       for (const tr of conf) { const age = this.time - (this.lastTrackDwell[tr.id] || -1e9); if (age > this.cfg.track.revisitS && age > worst) { worst = age; pick = tr; } }
       if (pick) { this.lastTrackDwell[pick.id] = this.time; this.lastTrackedId = pick.id; return Object.assign(this._trackBeam(pick), { kind: 'track' }); }
     }
-    const p = this.scanList[this.scanIdx];
+    const p = this.scanList[this.scanIdx] || { az: 0, el: 0, bar: 0 };
     this.scanIdx++;
     if (this.scanIdx >= this.scanList.length) { this.scanIdx = 0; this.frames++; this.frameTimeS = this.time - this.frameStartT; this.frameStartT = this.time; }
     return { az: p.az, el: p.el, kind: 'search', bar: p.bar };
@@ -1093,20 +1540,70 @@ class RadarSim {
         const x = R * Math.cos(depr * DEG) * Math.sin(az * DEG), y = R * Math.cos(depr * DEG) * Math.cos(az * DEG);
         const s0 = unDb(terrainSigma0Db(x, y)) * Math.sin(depr * DEG) / Math.sin(10 * DEG);
         const A = R * hp * DEG * d.rangeRes / Math.cos(depr * DEG);
-        const eq = radarEquation({ fGHz: fc, PtW: d.PtW, tauS: d.tau, nCoh: cfg.tx.nCpi, GtLin: unDb(d.g0Db + azR / 2 + elR / 2), GrLin: unDb(d.grDb + azR / 2 + elR / 2), rcs: s0 * A, Rm: R, nfDb: cfg.rx.nfDb, lossDb: cfg.rx.lossDb + d.mfLossDb, atmDb: gasLossTwoWayDb(R / 1000, fc, h, 0) });
+        const eq = radarEquation({ fGHz: fc, PtW: d.PtW, tauS: d.tau, nCoh: d.nCpiEff, GtLin: unDb(d.g0Db + azR / 2 + elR / 2), GrLin: unDb(d.grDb + azR / 2 + elR / 2), rcs: s0 * A, Rm: R, nfDb: cfg.rx.nfDb, lossDb: cfg.rx.lossDb + d.mfLossDb, atmDb: gasLossTwoWayDb(R / 1000, fc, h, 0) });
         const v = clamp((eq.snrDb + 5) / 45, 0, 1), k = ri * nA + ai;
         if (v > g.v[k]) g.v[k] = v;
       }
     }
   }
 
-  /* ---- 解析：单目标可探测性诊断(雷达方程+扫描匹配) ---- */
+  /* ---- 解析：单目标可探测性深度诊断 + 原因提示 + 措施建议 ---- */
   analyzeTarget(tg) {
     const cfg = this.cfg, d = this.derived, s = this.targetState(tg, this.time), fc = cfg.fGHz, arr = this.array;
-    const out = { id: tg.id, name: tg.name, R: s.R, az: s.az, el: s.el, closing: s.closing, fd: s.fd, alt: s.alt, verdict: 'OK', reasons: [] };
-    if (d.txInhibit) { out.verdict = 'TX_INHIBIT'; out.reasons.push(d.txInhibit === 'duty' ? `发射占空比 ${(d.duty * 100).toFixed(0)}% 超过 TR 热限 ${(cfg.tx.dutyMax * 100).toFixed(0)}%，发射被禁止` : '脉宽 ≥ PRI'); return out; }
-    if (!s.visible) { out.verdict = 'NO_LOS'; out.reasons.push(`超出无线电视距 (${horizonKm(cfg.own.alt, s.alt).toFixed(0)} km)`); }
-    if (s.R > this.rangeLimitM()) { out.verdict = 'TOO_FAR'; out.reasons.push(`超出处理量程 ${(this.rangeLimitM() / 1000).toFixed(0)} km`); }
+    const out = {
+      id: tg.id, name: tg.name, R: s.R, az: s.az, el: s.el, closing: s.closing, fd: s.fd, alt: s.alt,
+      verdict: 'OK', reasons: [], causes: [], suggestions: []
+    };
+    if (d.txInhibit) {
+      out.verdict = 'TX_INHIBIT';
+      const msg = d.txInhibit === 'duty'
+        ? `发射占空比 ${(d.duty * 100).toFixed(0)}% 超过 TR 组件热限制 ${(cfg.tx.dutyMax * 100).toFixed(0)}%，发射机保护闭锁`
+        : '脉冲宽度 τp ≥ 脉冲重复间隔 PRI，收发时序冲突导致发射闭锁';
+      out.reasons.push(msg);
+      out.causes.push({ code: 'TX_INHIBIT', severity: 'critical', title: '发射机占空比/时序过载保护闭锁', detail: msg });
+      out.suggestions.push({
+        id: 'fix_tx_inhibit',
+        title: '降低脉冲宽度或切换中/低重频体制',
+        desc: '将脉冲宽度 τp 调回 15 μs 并切换至 MPRF 3重频参差，解除发射机热闭锁。',
+        expectedGain: '恢复正常发射',
+        actionLabel: '一键解除发射闭锁 (τ=15μs, MPRF3)',
+        patch: { tx: { tauUs: 15, prfRegime: 'mprf3' } }
+      });
+      return out;
+    }
+    const rHorizKm = horizonKm(cfg.own.alt, s.alt);
+    if (!s.visible) {
+      out.verdict = 'NO_LOS';
+      const msg = `超出地球曲率无线电视距 (${rHorizKm.toFixed(0)} km < 斜距 ${(s.R / 1000).toFixed(1)} km)，目标被地平线遮挡`;
+      out.reasons.push(msg);
+      out.causes.push({ code: 'NO_LOS', severity: 'critical', title: '地球曲率/低空雷达视距遮挡', detail: msg });
+      out.suggestions.push({
+        id: 'fix_los_alt',
+        title: '抬升载机巡航高度扩展雷达视距',
+        desc: `将载机高度提升至 12500 m 可将低空视距扩展至 ${horizonKm(12500, s.alt).toFixed(0)} km。`,
+        expectedGain: '恢复直视视距 LOS',
+        actionLabel: '一键爬升载机高度至 12500m',
+        patch: { own: { alt: 12500 } }
+      });
+    }
+    if (s.R > this.rangeLimitM()) {
+      out.verdict = 'TOO_FAR';
+      const limKm = this.rangeLimitM() / 1000;
+      const msg = `目标斜距 ${(s.R / 1000).toFixed(1)} km 超出当前处理量程上限 ${limKm.toFixed(0)} km`;
+      out.reasons.push(msg);
+      out.causes.push({ code: 'TOO_FAR', severity: 'critical', title: '超出当前工作模式/显示器距离量程', detail: msg });
+      const needRange = Math.min(300, Math.ceil((s.R / 1000 + 30) / 20) * 20);
+      out.suggestions.push({
+        id: 'fix_range_limit',
+        title: cfg.mode === 'ACM' ? '退出 ACM 近距格斗模式并扩大量程' : `将最大处理量程扩展至 ${needRange} km`,
+        desc: cfg.mode === 'ACM' ? 'ACM 格斗模式固定量程为 18.5 km，切换至 RWS/TWS 可探测中远距目标。' : '扩大距离门采样窗口以覆盖远距目标。',
+        expectedGain: `量程覆盖至 ${needRange} km`,
+        actionLabel: cfg.mode === 'ACM' ? '一键切回 TWS 并扩大量程' : `一键扩大量程至 ${needRange} km`,
+        modeSwitch: cfg.mode === 'ACM' ? 'TWS' : null,
+        patch: { rangeMaxKm: needRange }
+      });
+    }
+
     // 扫描匹配：目标与最近扫描波束的真实角度差
     let bestLoss = 1e9, nearest = null;
     const uT = Math.sin(s.az * DEG) * Math.cos(s.el * DEG), vT = Math.sin(s.el * DEG);
@@ -1120,7 +1617,9 @@ class RadarSim {
     if (!nearest) nearest = { az: s.az, el: s.el };
     const tracking = (cfg.mode === 'STT' || cfg.mode === 'DTT') && this.lockId;
     const steer = tracking ? { az: s.az, el: s.el } : nearest;
+
     // 诊断与 dwell 同源：用真实扫描波束权值在目标方向求增益
+    const nulls = this._activeNulls();
     const wT = buildWeights(arr, this._wOpts(fc, steer.az, steer.el, false));
     const wR = buildWeights(arr, this._wOpts(fc, steer.az, steer.el, true));
     const gT = gainEval(arr, wT, fc, s.az, s.el), gR = gainEval(arr, wR, fc, s.az, s.el);
@@ -1129,16 +1628,41 @@ class RadarSim {
     out.scanOffsetDeg = tracking ? 0 : bestLoss;
     out.scanLossDb = scanLossDb;
     out.inScan = tracking ? true : scanLossDb < 4.5;
-    if (!out.inScan) { out.verdict = out.verdict === 'OK' ? 'OUT_OF_SCAN' : out.verdict; out.reasons.push(`目标(方位 ${s.az.toFixed(1)}°, 俯仰 ${s.el.toFixed(1)}°)落在扫描图形之外，距最近波束 ${bestLoss.toFixed(1)}°，波束失配损耗 ${scanLossDb.toFixed(1)} dB`); }
+    if (!out.inScan) {
+      out.verdict = out.verdict === 'OK' ? 'OUT_OF_SCAN' : out.verdict;
+      const msg = `目标(方位 ${s.az.toFixed(1)}°, 俯仰 ${s.el.toFixed(1)}°)落在扫描图形之外，距最近波束 ${bestLoss.toFixed(1)}°，波束失配损耗 ${scanLossDb.toFixed(1)} dB`;
+      out.reasons.push(msg);
+      out.causes.push({ code: 'OUT_OF_SCAN', severity: 'critical', title: '目标处于天线扫描空域覆盖范围外', detail: msg });
+      out.suggestions.push({
+        id: 'fix_scan_steer',
+        title: '将扫描扇区中心对准目标方位与俯仰角',
+        desc: `将扫描中心调整至 Az₀=${s.az.toFixed(0)}°, El₀=${s.el.toFixed(1)}°，消除 ${scanLossDb.toFixed(1)} dB 波束指向失配损耗。`,
+        expectedGain: `+${scanLossDb.toFixed(1)} dB 增益恢复`,
+        actionLabel: `一键对准扫描扇区 (Az=${s.az.toFixed(0)}°, El=${s.el.toFixed(1)}°)`,
+        patch: { scan: { azCenter: Math.round(clamp(s.az, -60, 60)), elCenter: Math.round(clamp(s.el, -25, 25) * 2) / 2 } }
+      });
+      if (cfg.scan.azHalf < 45 || cfg.scan.bars < 4) {
+        out.suggestions.push({
+          id: 'fix_scan_widen',
+          title: '扩大方位扫描半宽与俯仰行数 (Bars)',
+          desc: '将扫描扇区扩大为 ±60° × 4 Bars 大空域覆盖，防止大离轴角目标漏扫。',
+          expectedGain: '全扇区 ±60° 覆盖',
+          actionLabel: '一键扩大扫描扇区 (±60° / 4 Bars)',
+          patch: { scan: { azHalf: 60, bars: 4 } }
+        });
+      }
+    }
+
     const ps = [];
     let jn = 0;
-    for (const j of this.jammers) if (j.type === 'spot' || j.type === 'barrage') {
-      const bw = j.type === 'barrage' ? 4000e6 : j.bwMHz * 1e6, fj = j.type === 'barrage' ? 10 : j.fGHz;
-      const wRj = buildWeights(arr, this._wOpts(fc, s.az, s.el, true, cfg.eccm.adbf ? this.jammers.filter(q => q.type !== 'drfm').map(q => ({ az: q.azDeg, el: q.elDeg })) : []));
+    const wRj = buildWeights(arr, this._wOpts(fc, s.az, s.el, true, nulls));
+    for (const j of this.jammers) if (NOISE_JAMMER_TYPES.has(j.type)) {
+      const bw = j.type === 'barrage' ? 4000e6 : (j.type === 'swept' ? j.bwMHz * 3e6 : j.bwMHz * 1e6);
+      const fj = j.type === 'barrage' ? 10 : j.fGHz;
       if (!(j.type === 'barrage' || (!cfg.eccm.agility && Math.abs(fc - fj) <= bw / 2e9 + this.wf.B / 2e9))) continue;
       const lam = wavelength(fc), R = j.rangeKm * 1000, gj = gainEval(arr, wRj, fc, j.azDeg, j.elDeg);
-      jn += unDb(j.erpDbW) * lam * lam * gj / (Math.pow(4 * Math.PI, 2) * R * R * bw) / (KB * T0 * unDb(cfg.rx.nfDb));
-      if (cfg.eccm.agility && j.type === 'spot') jn *= 1;
+      const atm = j.type === 'swept' ? unDb(-0.5 * gasLossTwoWayDb(j.rangeKm, fc, cfg.own.alt, cfg.own.alt)) : 1;
+      jn += unDb(j.erpDbW) * lam * lam * gj / (Math.pow(4 * Math.PI, 2) * R * R * bw) * atm / (KB * T0 * unDb(cfg.rx.nfDb));
     }
     out.jnDb = dB(jn + 1e-30);
     for (let b = 0; b < d.nB; b++) {
@@ -1148,6 +1672,7 @@ class RadarSim {
     out.eq = this._link(tg, s, fc, gT, gR, 0, 1);
     out.eclipse = d.prfs.map(f => eclipseLossFraction(s.R, d.tau, d.trec, 1 / f));
     out.gTdb = dB(gT); out.gRdb = dB(gR);
+
     // 杂波/多普勒判定(用第一个 PRF)
     const ci = this.clutterInfo(steer.az, steer.el, fc, d.prfs[0]);
     let cn = 0;
@@ -1157,34 +1682,205 @@ class RadarSim {
       const ru = C / (2 * d.prfs[0]); let dR = Math.abs(s.R % ru - ci.Rg % ru); dR = Math.min(dR, ru - dR);
       if (dF < ci.width / 2 && dR < ci.footR / 2 + d.rangeRes) {
         const c = this._link(tg, s, fc, gT, gR, 0, ci.area * ci.sigma0 / tg.rcs); cn = unDb(c.snrDb); out.cnDb = c.snrDb;
-        if (cfg.eccm.dpca) { const eps = Math.max(1e-4, dpcaResponse(s.vGround, wavelength(fc), arr.diameter / 2, cfg.own.speed)); cn /= unDb(38); out.dpcaEps = eps; ps.forEach((v, i) => ps[i] = v + dB(eps)); }
+        if (cfg.eccm.dpca) {
+          const eps = Math.max(1e-4, dpcaResponse(s.vGround, wavelength(fc), arr.diameter / 2, cfg.own.speed));
+          cn /= unDb(38); out.dpcaEps = eps; ps.forEach((v, i) => ps[i] = v + dB(eps));
+        } else if (cfg.eccm.mtdNotch) {
+          cn /= unDb(18);
+        }
         out.inClutter = true;
       }
     }
-    const ns = 1 + jn + cn, nsDb = dB(ns); out.noiseRaiseDb = nsDb;
+
+    // 箔条走廊杂波与灵巧伴随噪声遮蔽评估
+    const spJam = this._evalTargetSpecialJamming(tg, s, fc, wT, wR, gT, gR);
+    cn += spJam.chaffCn;
+    if (spJam.chaffCn > 0) out.cnDb = dB(cn);
+
+    const ns = (1 + jn + cn) * spJam.smartMaskLin, nsDb = dB(ns);
+    out.noiseRaiseDb = nsDb;
+    const effNref = cfg.eccm.osCfar ? Math.max(cfg.rx.nRef, 48) : cfg.rx.nRef;
     const sinr = ps.map(v => unDb(v - nsDb)), pf = d.pfaBurst;
     out.snrBurstDb = ps.reduce((a, b) => a + b, 0) / ps.length - nsDb;
-    out.pdBurst = sinr.map(S => pdBurst(S, pf, cfg.rx.nRef, tg.swerling));
+    out.pdBurst = sinr.map(S => pdBurst(S, pf, effNref, tg.swerling));
     out.pdSys = pbTail(out.pdBurst, d.M);
-    out.reqSnrDb = requiredSnrDb(pf, 0.9, cfg.rx.nRef, tg.swerling);
+    out.reqSnrDb = requiredSnrDb(pf, 0.9, effNref, tg.swerling);
     out.marginDb = out.snrBurstDb - out.reqSnrDb;
+
     if (out.verdict === 'OK') {
-      if (out.inClutter && out.pdSys < 0.5) { out.verdict = 'CLUTTER'; out.reasons.push('目标多普勒/距离落入主瓣杂波，SCR 不足'); }
-      else if (jn > 1 && out.pdSys < 0.5) { out.verdict = 'JAMMED'; out.reasons.push(`压制干扰使噪声基底抬高 ${nsDb.toFixed(1)} dB，SINR 低于检测门限`); }
-      else if (out.pdSys < 0.5) {
+      if ((out.inClutter || spJam.activeChaff) && out.pdSys < 0.5) {
+        out.verdict = 'CLUTTER';
+        if (spJam.activeChaff) {
+          const msg = `目标处于无源箔条走廊 (Chaff RCS=${spJam.activeChaff.chaffRcs || 150}m²) 强杂波云内，噪底抬高 ${nsDb.toFixed(1)} dB`;
+          out.reasons.push(msg);
+          out.causes.push({ code: 'CLUTTER_CHAFF', severity: 'critical', title: '无源箔条走廊 (Chaff) 杂波遮蔽与 CFAR 门限抬升', detail: msg });
+          out.suggestions.push({
+            id: 'fix_chaff_mtd',
+            title: '开启自适应 MTD 杂波凹口滤波 + OS-CFAR 恒虚警',
+            desc: '利用箔条云低速特性通过 MTD 零速凹口滤除 30 dB 箔条回波，并用 OS-CFAR 消除边缘门限抬升。',
+            expectedGain: '+30 dB 箔条杂波抑制',
+            actionLabel: '一键开启 MTD 凹口 + OS-CFAR 抗箔条',
+            patch: { eccm: { mtdNotch: true, osCfar: true } }
+          });
+        } else {
+          const msg = '目标多普勒/距离落入下视主瓣地杂波谱带，信杂比 (SCR) 严重不足被地面强散射淹没';
+          out.reasons.push(msg);
+          out.causes.push({ code: 'CLUTTER_MAINLOBE', severity: 'critical', title: '下视主瓣地杂波淹没慢速目标', detail: msg });
+          out.suggestions.push({
+            id: 'fix_clutter_dpca',
+            title: '开启 DPCA 双子孔径相位中心偏置动目标相消',
+            desc: '利用左右子孔径时延相消抵消 >38 dB 静止地面主瓣杂波，提取慢速运动目标相位差。',
+            expectedGain: '+38 dB 主瓣杂波对消',
+            actionLabel: '一键开启 DPCA 杂波相消',
+            patch: { eccm: { dpca: true } }
+          });
+        }
+      } else if ((jn > 1 || spJam.activeSwept) && out.pdSys < 0.5) {
+        out.verdict = 'JAMMED';
+        const hasBarrage = this.jammers.some(j => j.type === 'barrage');
+        const hasSwept = !!spJam.activeSwept || this.jammers.some(j => j.type === 'swept');
+        const msg = `有源压制干扰使有效噪声基底抬高 ${nsDb.toFixed(1)} dB，净信干噪比 SINR (${out.snrBurstDb.toFixed(1)} dB) 低于检测门限 (${out.reqSnrDb.toFixed(1)} dB)`;
+        out.reasons.push(msg);
+        out.causes.push({
+          code: hasBarrage ? 'JAM_BARRAGE' : (hasSwept ? 'JAM_SWEPT' : 'JAM_SPOT'),
+          severity: 'critical',
+          title: hasBarrage ? '宽带阻塞式噪声压制干扰 (Barrage)' : (hasSwept ? '扫频/灵巧伴随式噪声干扰 (Swept/Smart Noise)' : '窄带瞄准式噪声压制干扰 (Spot Jamming)'),
+          detail: msg
+        });
+        if (!cfg.eccm.adbf) {
+          out.suggestions.push({
+            id: 'fix_jam_adbf',
+            title: '开启 ADBF (MVDR 空域自适应方向图零陷)',
+            desc: '在接收数字波束形成器中对全部干扰源方向生成 <-50 dB 深零陷，阻断干扰能量进入接收机。',
+            expectedGain: `消除 ~${nsDb.toFixed(0)} dB 干扰噪底`,
+            actionLabel: '一键开启 ADBF 空域自适应零陷',
+            patch: { eccm: { adbf: true } }
+          });
+        }
+        if (!cfg.eccm.agility && !hasBarrage) {
+          out.suggestions.push({
+            id: 'fix_jam_agil',
+            title: '开启全 X 波段 (8~12 GHz) 脉间伪随机频率捷变',
+            desc: '在每个脉冲串间随机跳变载频，使窄带瞄准式/扫频干扰失锁落空。',
+            expectedGain: '+18~25 dB 抗瞄准干扰增益',
+            actionLabel: '一键开启全频段脉间捷变频 (AGIL)',
+            patch: { eccm: { agility: true } }
+          });
+        }
+        if (hasSwept && !cfg.eccm.osCfar) {
+          out.suggestions.push({
+            id: 'fix_jam_oscfar',
+            title: '启用 OS-CFAR 有序统计量恒虚警检测',
+            desc: '剔除灵巧伴随噪声对参考单元的污染，消除 7.5 dB 的 CFAR 门限自遮蔽抬升。',
+            expectedGain: '+7.5 dB 抗灵巧噪声门限恢复',
+            actionLabel: '一键开启 OS-CFAR 抗灵巧噪声',
+            patch: { eccm: { osCfar: true } }
+          });
+        }
+        if (hasBarrage && !cfg.eccm.burnThrough) {
+          out.suggestions.push({
+            id: 'fix_jam_burn',
+            title: '激活高能量凝视烧穿模式 (Burn-Through)',
+            desc: '加倍单驻留相参积累脉冲数并提升发射峰值功率，强行烧穿宽带阻塞噪声基底。',
+            expectedGain: '+6.5 dB 烧穿能量增益',
+            actionLabel: '一键开启 Burn-Through 功率烧穿',
+            patch: { eccm: { burnThrough: true, adbf: true } }
+          });
+        }
+      } else if (out.pdSys < 0.5) {
         const ecl = Math.max(...out.eclipse);
         out.verdict = ecl > 0.5 && out.marginDb > -3 ? 'ECLIPSED' : 'LOW_SNR';
-        out.reasons.push(`单次 SINR ${out.snrBurstDb.toFixed(1)} dB < 所需 ${out.reqSnrDb.toFixed(1)} dB (Pd=0.9)，系统 Pd=${(out.pdSys * 100).toFixed(1)}%`);
+        const msg = `单次 SINR ${out.snrBurstDb.toFixed(1)} dB < 所需门限 ${out.reqSnrDb.toFixed(1)} dB (Pd=0.9)，系统检测概率 Pd=${(out.pdSys * 100).toFixed(1)}%`;
+        out.reasons.push(msg);
+
+        if (out.verdict === 'ECLIPSED') {
+          out.causes.push({ code: 'ECLIPSED', severity: 'warn', title: '发射脉冲距离遮蔽盲区损耗 (Pulse Eclipsing)', detail: `目标回波到达时刻与发射窗口重叠达 ${(ecl * 100).toFixed(0)}%，回波能量被接收保护开关截断。` });
+          out.suggestions.push({
+            id: 'fix_eclipse_prf',
+            title: '切换多重频参差 PRF 体制并缩短脉宽',
+            desc: '采用 MPRF 4重频组 (11/12.7/14.3/17 kHz) 错开各 PRF 盲区，实现全距离段无遮蔽探测。',
+            expectedGain: '消除发射遮蔽盲区',
+            actionLabel: '一键切换 4重频参差解遮蔽',
+            patch: { tx: { prfRegime: 'mprf8', tauUs: Math.min(cfg.tx.tauUs, 12) } }
+          });
+        } else {
+          // 细分 LOW_SNR 根本原因：强降雨衰减 vs VLO 隐身小 RCS vs 远距离 R^4 扩散
+          const rainLoss = out.eq.terms.rainDb || 0;
+          if (rainLoss > 4.0 && cfg.fGHz > 9.0) {
+            out.causes.push({
+              code: 'RAIN_ATTEN', severity: 'critical',
+              title: `高频段 (${cfg.fGHz.toFixed(1)} GHz) 强降雨双程衰减过大 (${rainLoss.toFixed(1)} dB)`,
+              detail: `根据 ITU-R P.838 模型，${cfg.env.rainMmH} mm/h 降雨在 ${cfg.fGHz.toFixed(1)} GHz 产生 ${rainLoss.toFixed(1)} dB 双程损耗，导致回波低于门限。`
+            });
+            const lowRainLoss = rainLossTwoWayDb(s.R / 1000, 8.0, cfg.env.rainMmH, cfg.env.rainExtentKm, cfg.own.alt, s.alt, cfg.env.rainTopKm);
+            out.suggestions.push({
+              id: 'fix_rain_freq',
+              title: '下调频率至 8.00 GHz 低雨衰频点并开启能量烧穿',
+              desc: `8.0 GHz 下双程雨衰从 ${rainLoss.toFixed(1)} dB 降至 ${lowRainLoss.toFixed(1)} dB (节省 ${(rainLoss - lowRainLoss).toFixed(1)} dB)，配合相参积累增强克服剩余雨衰！`,
+              expectedGain: `+${(rainLoss - lowRainLoss).toFixed(1)} dB 雨衰改善`,
+              actionLabel: '一键切换 8.0 GHz 低雨衰频点 + 能量增强',
+              patch: { fGHz: 8.0, tx: { tauUs: 20, nCpi: 256 }, array: { trPeakW: 20, rxTaper: 'uniform' }, eccm: { burnThrough: true } }
+            });
+          }
+          if (tg.rcs < 0.2) {
+            out.causes.push({
+              code: 'STEALTH_LOW_RCS', severity: 'critical',
+              title: `目标极低雷达散射截面积 (VLO 隐身 σ=${tg.rcs} m²)`,
+              detail: `目标散射截面积仅为 ${tg.rcs} m² (${(10 * Math.log10(tg.rcs)).toFixed(1)} dBsm)，常规短脉冲与小相参积累能量不足以跨过 CFAR 门限。`
+            });
+          } else {
+            out.causes.push({
+              code: 'RANGE_ATTEN', severity: 'warn',
+              title: `远距双程自由空间 R⁴ 扩散损耗过大 (${out.eq.terms.R4Db.toFixed(1)} dB)`,
+              detail: `当前距离 ${(s.R / 1000).toFixed(1)} km 超出当前雷达能量配置下的 90% 探测包线 Rmax (${this.maxRangeFor(tg, gT, gR, s, nsDb).toFixed(0)} km)。`
+            });
+          }
+          out.suggestions.push({
+            id: 'fix_low_snr_energy',
+            title: '增大脉冲宽度 τp、相参积累脉冲数 Ncpi 与 TR 功率',
+            desc: '将脉宽增至 20 μs (保持占空比<35%)、相参积累增至 256 脉冲、单 TR 功率提至 18 W 并采用均匀高增益加权，大幅提升单驻留总能量。',
+            expectedGain: `+${(10 * Math.log10((20 / cfg.tx.tauUs) * (256 / cfg.tx.nCpi) * (18 / cfg.array.trPeakW))).toFixed(1)} dB 能量增益`,
+            actionLabel: '一键高能量探测增强 (τ=20μs+256脉冲+高功率)',
+            patch: { fGHz: cfg.env.rainMmH > 5 ? 8.0 : 11.5, tx: { tauUs: 20, nCpi: 256 }, array: { trPeakW: 18, rxTaper: 'uniform' } }
+          });
+        }
       }
     }
+
+    // 检查是否存在针对该目标的 DRFM / VGPO / RVGPO 欺骗干扰威胁（即使真目标可检出，波门也可能被假目标拖引）
+    const activeDeception = this.jammers.filter(j => DECEPTION_JAMMER_TYPES.has(j.type) && j.targetId === tg.id);
+    if (activeDeception.length > 0) {
+      const jTypes = activeDeception.map(j => j.type.toUpperCase()).join('/');
+      const hasVgpo = activeDeception.some(j => j.type === 'vgpo' || j.type === 'rvgpo');
+      const hasRgpo = activeDeception.some(j => j.type === 'drfm' || j.type === 'rvgpo');
+      const unprotected = (hasRgpo && (cfg.tx.waveform !== 'costas' || !cfg.eccm.leadingEdge)) || (hasVgpo && !cfg.eccm.dopplerGate);
+      if (unprotected) {
+        out.deceptionWarn = true;
+        out.causes.push({
+          code: 'DECEPTION_THREAT', severity: 'warn',
+          title: `遭受自卫式数字射频存储欺骗干扰 (${jTypes})`,
+          detail: `敌机正释放高功率 ${jTypes} 假目标，若不开启抗欺骗措施，跟踪波门将被假目标拖引偏离真目标导致失锁！`
+        });
+        out.suggestions.push({
+          id: 'fix_deception_eccm',
+          title: '启用 Welch-Costas 跳频波形 + 前沿跟踪 + 多普勒一致性鉴别',
+          desc: '通过脉内正交跳频失配抑制跨脉冲转发假目标，结合距离前沿波门与多普勒-距离率交叉核验锁定真目标。',
+          expectedGain: '抑制假目标 >18 dB 防脱锁',
+          actionLabel: '一键开启全套抗欺骗措施 (Costas+前沿+多普勒鉴别)',
+          patch: { tx: { waveform: 'costas' }, eccm: { leadingEdge: true, dopplerGate: true, agility: true } }
+        });
+      }
+    }
+
     if (out.verdict === 'OK') out.reasons.push(`余量 +${out.marginDb.toFixed(1)} dB，系统 Pd=${(out.pdSys * 100).toFixed(1)}%`);
-    // 雷达方程最大探测距离(波束对准、Pd=0.9)
     out.rmaxKm = this.maxRangeFor(tg, gT, gR, s, nsDb);
     return out;
   }
+
   maxRangeFor(tg, gT, gR, s, noiseRaiseDb) {
     const cfg = this.cfg, d = this.derived, fc = cfg.fGHz;
-    const need = requiredSnrDb(d.pfaBurst, 0.9, cfg.rx.nRef, tg.swerling) + noiseRaiseDb;
+    const effNref = cfg.eccm.osCfar ? Math.max(cfg.rx.nRef, 48) : cfg.rx.nRef;
+    const need = requiredSnrDb(d.pfaBurst, 0.9, effNref, tg.swerling) + noiseRaiseDb;
     let lo = 1, hi = 1500;
     for (let i = 0; i < 40; i++) {
       const m = (lo + hi) / 2, ss = Object.assign({}, s, { R: m * 1000, alt: s.alt });
@@ -1194,21 +1890,22 @@ class RadarSim {
     return lo;
   }
 
-  /** 合成指定波束指向下的实时 A-Scope 脉压距离像与滑动窗 CA-CFAR 门限 */
+  /** 合成指定波束指向下的实时 A-Scope 脉压距离像与滑动窗 CA/OS-CFAR 门限 */
   synthesizeAscope(beamAz, beamEl, nBins, rMaxKm) {
     nBins = nBins || 256;
     const cfg = this.cfg, d = this.derived, arr = this.array, tx = cfg.tx;
     const maxKm = rMaxKm || (cfg.mode === 'ACM' ? 20 : Math.min(cfg.rangeMaxKm, 200));
     const fc = cfg.fGHz, lam = wavelength(fc), prf = d.prfs[0], pri = 1 / prf;
-    const nulls = cfg.eccm.adbf ? this.jammers.filter(j => j.type !== 'drfm').map(j => ({ az: j.azDeg, el: j.elDeg })) : [];
+    const nulls = this._activeNulls();
     const wT = buildWeights(arr, this._wOpts(fc, beamAz, beamEl, false));
     const wR = buildWeights(arr, this._wOpts(fc, beamAz, beamEl, true, nulls));
 
-    // 1. 计算热噪声 + 压制干扰基底 (线性功率，以热噪声 N0=1 归一化)
+    // 1. 计算热噪声 + 压制干扰基底
     let JN = 0;
     for (const j of this.jammers) {
-      if (j.type !== 'spot' && j.type !== 'barrage') continue;
-      const bw = j.type === 'barrage' ? 4000e6 : j.bwMHz * 1e6, fj = j.type === 'barrage' ? 10 : j.fGHz;
+      if (!NOISE_JAMMER_TYPES.has(j.type)) continue;
+      const bw = j.type === 'barrage' ? 4000e6 : (j.type === 'swept' ? j.bwMHz * 3e6 : j.bwMHz * 1e6);
+      const fj = j.type === 'barrage' ? 10 : j.fGHz;
       const overlap = j.type === 'barrage' || (!cfg.eccm.agility && Math.abs(fc - fj) <= (bw / 1e9) / 2 + this.wf.B / 2e9);
       if (!overlap) continue;
       const R = j.rangeKm * 1000, gJ = gainEval(arr, wR, fc, j.azDeg, j.elDeg);
@@ -1224,17 +1921,31 @@ class RadarSim {
       pwr[i] = baseNoise * Math.max(0.15, rng.exp());
     }
 
-    // 2. 地杂波距离包络
+    // 2. 地杂波与箔条走廊距离包络
     const ci = this.clutterInfo(beamAz, beamEl, fc, prf);
     if (ci && ci.Rg / 1000 < maxKm) {
       const dummyTg = { rcs: ci.area * ci.sigma0 };
       const cEq = this._link(dummyTg, { R: ci.Rg, alt: 0 }, fc, unDb(d.g0Db), unDb(d.grDb), 0, 1);
       let cLin = unDb(cEq.snrDb);
       if (cfg.eccm.dpca) cLin /= unDb(38);
+      else if (cfg.eccm.mtdNotch) cLin /= unDb(18);
       const cCenter = ci.Rg / 1000, cHalfKm = Math.max(1.5, ci.footR / 2000);
       for (let i = 0; i < nBins; i++) {
         const u = (rKm[i] - cCenter) / cHalfKm;
         if (Math.abs(u) < 2.5) pwr[i] += cLin * Math.exp(-1.5 * u * u) * (0.6 + 0.8 * rng.next());
+      }
+    }
+    // 箔条走廊回波包络
+    for (const j of this.jammers) {
+      if (j.type !== 'chaff') continue;
+      if (Math.abs(j.azDeg - beamAz) > d.hpbwRxDeg * 2.2) continue;
+      const chaffRcs = j.chaffRcs || 150;
+      const cEq = this._link({ rcs: chaffRcs }, { R: j.rangeKm * 1000, alt: cfg.own.alt }, fc, gainEval(arr, wT, fc, j.azDeg, j.elDeg), gainEval(arr, wR, fc, j.azDeg, j.elDeg), 0, 1);
+      let cLin = unDb(cEq.snrDb);
+      if (cfg.eccm.mtdNotch) cLin /= unDb(52);
+      for (let i = 0; i < nBins; i++) {
+        const u = (rKm[i] - j.rangeKm) / 2.2;
+        if (Math.abs(u) < 2.5) pwr[i] += cLin * Math.exp(-1.2 * u * u) * (0.5 + 0.9 * rng.next());
       }
     }
 
@@ -1261,22 +1972,25 @@ class RadarSim {
         const shape = k === 0 ? 1.0 : Math.pow(env[envIdx], 2);
         pwr[bi] += S * shape;
       }
-      targetsInProfile.push({ id: tg.id, name: tg.name, rKm: s.R / 1000, bin: clamp(b0, 0, nBins - 1), snrDb: dB(S + 1e-30), sinrDb: dB(S / baseNoise + 1e-30) });
+      const bClamped = clamp(b0, 0, nBins - 1);
+      targetsInProfile.push({ id: tg.id, name: tg.name, rKm: s.R / 1000, bin: bClamped, snrDb: dB(S + 1e-30), sinrDb: dB(S / baseNoise + 1e-30), detected: false });
     });
 
-    // 4. 注入 DRFM 假目标 (受 Costas 跨脉冲匹配滤波失配因子 rho 调制)
+    // 4. 注入 DRFM / VGPO / RVGPO 假目标
     this.jammers.forEach(j => {
-      if (j.type !== 'drfm' || d.txInhibit) return;
+      if (!DECEPTION_JAMMER_TYPES.has(j.type) || d.txInhibit) return;
       const ti = this.targets.findIndex(tg => tg.id === j.targetId);
       if (ti < 0) return;
       const s = states[ti];
       if (!s.visible || s.R / 1000 > maxKm) return;
       const gR = gainEval(arr, wR, fc, s.az, s.el);
-      const rho = (tx.waveform === 'costas' ? d.drfmRho.hop : 1) * (cfg.eccm.agility ? Math.min(1, (this.wf.B / 1e9) / (cfg.eccm.agHighGHz - cfg.eccm.agLowGHz)) : 1);
+      let rho = (tx.waveform === 'costas' ? d.drfmRho.hop : 1) * (cfg.eccm.agility ? Math.min(1, (this.wf.B / 1e9) / (cfg.eccm.agHighGHz - cfg.eccm.agLowGHz)) : 1);
+      if ((j.type === 'vgpo' || j.type === 'rvgpo') && cfg.eccm.dopplerGate) rho /= unDb(18);
       const atm1 = unDb(-0.5 * gasLossTwoWayDb(s.R / 1000, fc, cfg.own.alt, s.alt));
-      const Sf0 = unDb(j.erpDbW) * gR * lam * lam / (Math.pow(4 * Math.PI, 2) * s.R * s.R) * d.tau * tx.nCpi * rho * atm1 / (KB * T0 * unDb(cfg.rx.nfDb) * unDb(cfg.rx.lossDb)) / unDb(d.mfLossDb);
-      const per = j.rgpoMaxKm * 1000 / j.rgpoRate + 4, ph = this.time % per;
-      const offs = [Math.min(j.rgpoMaxKm * 1000, j.rgpoRate * ph), 4500, 9000];
+      const Sf0 = unDb(j.erpDbW) * gR * lam * lam / (Math.pow(4 * Math.PI, 2) * s.R * s.R) * d.tau * d.nCpiEff * rho * atm1 / (KB * T0 * unDb(cfg.rx.nfDb) * unDb(cfg.rx.lossDb)) / unDb(d.mfLossDb);
+      const per = (j.rgpoMaxKm || 6) * 1000 / (j.rgpoRate || 150) + 4, ph = this.time % per;
+      const off1 = j.type === 'vgpo' ? 180 : Math.min((j.rgpoMaxKm || 6) * 1000, (j.rgpoRate || 150) * ph);
+      const offs = j.type === 'vgpo' ? [off1] : [off1, 4500, 9000];
       offs.forEach((off, gi) => {
         const RgKm = (s.R + off) / 1000;
         if (RgKm >= maxKm) return;
@@ -1285,22 +1999,39 @@ class RadarSim {
       });
     });
 
-    // 5. 滑动窗 CA-CFAR 门限计算
+    // 5. 滑动窗 CA-CFAR / OS-CFAR 门限计算
     const cfarDb = new Float64Array(nBins), powerDb = new Float64Array(nBins);
     const halfRef = Math.max(4, Math.min(16, Math.floor(cfg.rx.nRef / 2))), guard = 2;
     const detections = [];
     for (let i = 0; i < nBins; i++) powerDb[i] = dB(pwr[i] + 1e-30);
     for (let i = 0; i < nBins; i++) {
-      let sum = 0, cnt = 0;
+      const cells = [];
       for (let k = -halfRef - guard; k <= halfRef + guard; k++) {
         if (Math.abs(k) <= guard) continue;
         const idx = i + k;
-        if (idx >= 0 && idx < nBins) { sum += pwr[idx]; cnt++; }
+        if (idx >= 0 && idx < nBins) cells.push(pwr[idx]);
       }
-      const refMean = cnt > 0 ? sum / cnt : baseNoise;
+      let refMean = baseNoise;
+      if (cells.length > 0) {
+        if (cfg.eccm.osCfar) {
+          cells.sort((a, b) => a - b);
+          const qIdx = Math.floor(cells.length * 0.65);
+          refMean = cells[qIdx] / 0.92; // OS-CFAR 分位数估计抵御干扰/箔条边缘污染
+        } else {
+          let sum = 0; for (let c = 0; c < cells.length; c++) sum += cells[c];
+          refMean = sum / cells.length;
+        }
+      }
       const thLin = refMean * d.alpha;
       cfarDb[i] = dB(thLin + 1e-30);
       if (pwr[i] > thLin) detections.push({ bin: i, rKm: rKm[i], snrDb: dB(pwr[i] / refMean) });
+    }
+    // 仅当目标所在距离单元实际跨过 CFAR 门限且目标当前可被雷达探测时，才标记 detected = true
+    for (const tp of targetsInProfile) {
+      const overCfar = pwr[tp.bin] > unDb(cfarDb[tp.bin]);
+      const tgObj = this.targets.find(q => q.id === tp.id);
+      const diag = tgObj ? this.analyzeTarget(tgObj) : null;
+      tp.detected = !!(overCfar && diag && diag.verdict === 'OK');
     }
     return { rKm, powerDb, cfarDb, noiseFloorDb: dB(baseNoise), maxKm, detections, targetsInProfile };
   }
@@ -1310,14 +2041,15 @@ class RadarSim {
     nR = nR || 64; nD = nD || 40;
     const cfg = this.cfg, d = this.derived, arr = this.array;
     const fc = cfg.fGHz, lam = wavelength(fc), prf = d.prfs[0], ruKm = C / (2 * prf) / 1000;
-    const nulls = cfg.eccm.adbf ? this.jammers.filter(j => j.type !== 'drfm').map(j => ({ az: j.azDeg, el: j.elDeg })) : [];
+    const nulls = this._activeNulls();
     const wT = buildWeights(arr, this._wOpts(fc, beamAz, beamEl, false));
     const wR = buildWeights(arr, this._wOpts(fc, beamAz, beamEl, true, nulls));
 
     let JN = 0;
     for (const j of this.jammers) {
-      if (j.type !== 'spot' && j.type !== 'barrage') continue;
-      const bw = j.type === 'barrage' ? 4000e6 : j.bwMHz * 1e6, fj = j.type === 'barrage' ? 10 : j.fGHz;
+      if (!NOISE_JAMMER_TYPES.has(j.type)) continue;
+      const bw = j.type === 'barrage' ? 4000e6 : (j.type === 'swept' ? j.bwMHz * 3e6 : j.bwMHz * 1e6);
+      const fj = j.type === 'barrage' ? 10 : j.fGHz;
       const overlap = j.type === 'barrage' || (!cfg.eccm.agility && Math.abs(fc - fj) <= (bw / 1e9) / 2 + this.wf.B / 2e9);
       if (!overlap) continue;
       const R = j.rangeKm * 1000, gJ = gainEval(arr, wR, fc, j.azDeg, j.elDeg);
@@ -1335,6 +2067,7 @@ class RadarSim {
       const dummyTg = { rcs: ci.area * ci.sigma0 };
       let cLin = unDb(this._link(dummyTg, { R: ci.Rg, alt: 0 }, fc, unDb(d.g0Db), unDb(d.grDb), 0, 1).snrDb);
       if (cfg.eccm.dpca) cLin /= unDb(38);
+      else if (cfg.eccm.mtdNotch) cLin /= unDb(18);
       const dCenter = (fclFold / prf + 0.5) * (nD - 1);
       const dSigma = Math.max(1.2, (ci.width / prf) * nD * 0.5);
       for (let ri = 0; ri < nR; ri++) {
@@ -1348,7 +2081,7 @@ class RadarSim {
       }
     }
 
-    // 目标 R-D 峰值
+    // 目标 R-D 峰值 (仅当目标可检出时在 markers 中标记 detected: true)
     const markers = [];
     this.targets.forEach(tg => {
       if (d.txInhibit) return;
@@ -1365,6 +2098,7 @@ class RadarSim {
       const fdFold = foldDoppler(s.fd, prf);
       const rIdx = clamp(Math.floor(rFoldKm / ruKm * nR), 0, nR - 1);
       const dIdx = clamp(Math.floor((fdFold / prf + 0.5) * nD), 0, nD - 1);
+      const cellBg = unDb(gridDb[rIdx * nD + dIdx]);
       for (let dr = -1; dr <= 1; dr++) for (let dd = -1; dd <= 1; dd++) {
         const rr = rIdx + dr, dd2 = dIdx + dd;
         if (rr >= 0 && rr < nR && dd2 >= 0 && dd2 < nD) {
@@ -1372,7 +2106,9 @@ class RadarSim {
           gridDb[rr * nD + dd2] = dB(unDb(gridDb[rr * nD + dd2]) + S * w);
         }
       }
-      markers.push({ id: tg.id, name: tg.name, rIdx, dIdx, rFoldKm, fdFold, snrDb: dB(S + 1e-30), sinrDb: dB(S / baseNoise + 1e-30) });
+      const diag = this.analyzeTarget(tg);
+      const detected = (S / Math.max(cellBg, baseNoise) >= d.alpha) && diag.verdict === 'OK';
+      markers.push({ id: tg.id, name: tg.name, rIdx, dIdx, rFoldKm, fdFold, snrDb: dB(S + 1e-30), sinrDb: dB(S / baseNoise + 1e-30), detected });
     });
 
     return { gridDb, nR, nD, ruKm, prfHz: prf, noiseFloorDb: dB(baseNoise), markers };
